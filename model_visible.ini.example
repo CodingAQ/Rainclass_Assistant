@@ -1,0 +1,15 @@
+# 先复制 .example 文件，将后缀改为 .ini
+
+# 填入所有可调用的视觉模型，当选择 多AI答题 时，会同时调用下面的AI，取最优答案
+
+[model_name_1]
+base_url = 
+key = 
+model = 
+description = 
+
+[model_name_2]
+base_url = 
+key = 
+model = 
+description = 

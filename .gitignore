@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+# Environment variables file (secrets)
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.workbuddy/
+
+# Project data
+config.json
+cookies.txt
+browser_state.json
+.rainclass-assistant.lock
+model_visible.ini
+data/
+debug/
+
+# Playwright browsers
+.browsers/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+*.log.1
+
+# Local deepwork progress
+.slim/
+
+# Temporary files
+testQuestion/
+Original/
+docx/
