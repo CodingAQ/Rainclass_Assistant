@@ -25,6 +25,28 @@ from openai.types.chat import ChatCompletionMessageParam
 
 logger = logging.getLogger(__name__)
 
+# 模型报错可能携带整页 HTML（如 Cloudflare 挑战页）或巨型 payload，
+# 全量写进日志会刷爆 GUI 控制窗格和日志文件，因此统一压缩。
+_ERROR_LOG_LIMIT = 120
+_HTML_MARKERS = ("<html", "<!doctype", "<script", "just a moment", "challenge")
+
+
+def _compact_error(value: object, limit: int = _ERROR_LOG_LIMIT) -> str:
+    """把异常/错误文本压成适合日志的一行短消息。
+
+    - 压平空白字符
+    - 内容像 HTML 页面时直接归类为"疑似被网关拦截"，不保留正文
+    - 超过 limit 字符时截断并标注原始长度
+    """
+    text = str(value).strip()
+    compact = re.sub(r"\s+", " ", text)
+    lowered = compact.lower()
+    if any(marker in lowered for marker in _HTML_MARKERS):
+        return "返回 HTML 页面（疑似被网关或 Cloudflare 拦截）"
+    if len(compact) > limit:
+        return f"{compact[:limit]}...(已截断，原始 {len(text)} 字符)"
+    return compact
+
 # 提示词模板：统一 JSON 返回，不再区分客观/主观两套提示词
 PROMPT_ANSWER = (
     "请分析这张图片中的习题，并返回题目类型和正确的答案选项json，格式为："
@@ -296,7 +318,7 @@ class AIService:
             with path.open("r", encoding="utf-8-sig") as file:
                 parser.read_file(file)
         except (OSError, configparser.Error) as exc:
-            logger.error("多AI配置文件读取失败：%s", exc)
+            logger.error("多AI配置文件读取失败：%s", _compact_error(exc))
             return []
 
         endpoints: list[_MultiAIEndpoint] = []
@@ -730,8 +752,8 @@ class AIService:
                 .strip()
             )
         except Exception as e:
-            logger.error(f"调用Gemini AI API 失败：{e}")
-            return f"Gemini AI调用失败：{e}"
+            logger.error("调用Gemini AI API 失败：%s", _compact_error(e))
+            return f"Gemini AI调用失败：{_compact_error(e)}"
 
     # ==================== 自定义 Provider ====================
 

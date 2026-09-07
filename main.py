@@ -40,6 +40,31 @@ class _GuiLogHandler(logging.Handler):
         _gui_log_queue.put(self.format(record))
 
 
+class _MaxLogLengthFilter(logging.Filter):
+    """日志长度闸门：超长记录截断后再落盘/上屏。
+
+    模型报错、SDK 调试日志可能携带整页 HTML 或 base64 数据（曾出现
+    单条 315KB 的日志），会在 GUI 控制窗格刷屏并撑爆日志文件。
+    正常业务日志远低于该上限，不受影响。
+    """
+
+    def __init__(self, limit: int = 1000) -> None:
+        super().__init__()
+        self.limit = limit
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        if len(message) > self.limit:
+            record.msg = (
+                f"{message[:self.limit]}...(日志过长已截断，原始 {len(message)} 字符)"
+            )
+            record.args = None
+        return True
+
+
 def _setup_logging() -> None:
     global _log_listener
     if _log_listener is not None:
@@ -57,11 +82,14 @@ def _setup_logging() -> None:
     qh = QueueHandler(_log_queue)
     root_logger.addHandler(qh)
 
+    length_gate = _MaxLogLengthFilter()
     fh = RotatingFileHandler("bot.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
     fh.setFormatter(LOG_FORMAT)
+    fh.addFilter(length_gate)
 
     gh = _GuiLogHandler()
     gh.setFormatter(LOG_FORMAT)
+    gh.addFilter(_MaxLogLengthFilter(500))
 
     _log_listener = QueueListener(_log_queue, fh, gh)
     _log_listener.start()

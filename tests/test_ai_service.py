@@ -1,4 +1,5 @@
 import json
+import logging
 import tempfile
 import threading
 import time
@@ -7,7 +8,8 @@ from concurrent.futures import Future
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from src.ai.service import AIService, PROMPT_ANSWER, _MultiAIEndpoint
+from src.ai.service import AIService, PROMPT_ANSWER, _MultiAIEndpoint, _compact_error
+from main import _MaxLogLengthFilter
 
 
 class FakeConfig:
@@ -365,6 +367,44 @@ model = second-model
             result = service._ask_multi("aW1hZ2U=", "prompt")
 
         self.assertIn("调用失败", result)
+
+
+class CompactErrorTests(unittest.TestCase):
+    def test_html_error_is_classified_not_dumped(self):
+        cloudflare = '<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title>' + "x" * 16000
+        self.assertEqual(
+            _compact_error(cloudflare),
+            "返回 HTML 页面（疑似被网关或 Cloudflare 拦截）",
+        )
+
+    def test_long_error_is_truncated(self):
+        result = _compact_error("E" * 5000)
+        self.assertTrue(result.startswith("E" * 120))
+        self.assertIn("原始 5000 字符", result)
+        self.assertLess(len(result), 200)
+
+    def test_short_error_is_kept_and_whitespace_collapsed(self):
+        self.assertEqual(_compact_error("Error code: 429 -\n  insufficient balance"),
+                         "Error code: 429 - insufficient balance")
+
+
+class MaxLogLengthFilterTests(unittest.TestCase):
+    def _record(self, message: str) -> logging.LogRecord:
+        return logging.LogRecord(
+            "test", logging.WARNING, __file__, 1, message, None, None
+        )
+
+    def test_long_record_is_truncated(self):
+        gate = _MaxLogLengthFilter(limit=100)
+        record = self._record("A" * 5000)
+        self.assertTrue(gate.filter(record))
+        self.assertIn("原始 5000 字符", record.getMessage())
+
+    def test_normal_record_untouched(self):
+        gate = _MaxLogLengthFilter(limit=100)
+        record = self._record("正常业务日志")
+        self.assertTrue(gate.filter(record))
+        self.assertEqual(record.getMessage(), "正常业务日志")
 
 
 if __name__ == "__main__":
