@@ -5,6 +5,8 @@ from concurrent.futures import Future
 from typing import Any, cast
 from unittest.mock import mock_open, patch
 
+from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
 from src.bot import Bot
 from src.browser import BrowserManager
 
@@ -76,13 +78,23 @@ class FakeLocator:
 
 
 class FakePage:
-    def __init__(self, url, selectors=None, closed=False, evaluated=None):
+    def __init__(
+        self,
+        url,
+        selectors=None,
+        closed=False,
+        evaluated=None,
+        close_error=None,
+    ):
         self.url = url
         self.selectors = selectors or {}
         self.closed = closed
         self.front = False
         self.evaluated = evaluated
         self.content_calls = 0
+        self.close_error = close_error
+        self.close_calls = 0
+        self.reload_calls = 0
 
     def is_closed(self):
         return self.closed
@@ -111,6 +123,15 @@ class FakePage:
 
     def wait_for_timeout(self, timeout):
         return None
+
+    def close(self):
+        self.close_calls += 1
+        if self.close_error:
+            raise self.close_error
+        self.closed = True
+
+    def reload(self, timeout=None):
+        self.reload_calls += 1
 
 
 class FakeBrowser:
@@ -287,6 +308,36 @@ class ClassroomPageTests(unittest.TestCase):
         click_course.assert_not_called()
         classroom_loop.assert_called_once_with(classroom)
 
+    def test_waiting_for_class_message_is_logged_only_once(self):
+        home = FakePage("https://changjiang.yuketang.cn/v2/web/index")
+
+        def no_active_class(selector, timeout=None):
+            raise PlaywrightTimeout("no active class")
+
+        home.wait_for_selector = no_active_class
+        bot = make_bot([home])
+
+        with patch.object(bot, "log") as log:
+            bot._get_into_class()
+            bot._get_into_class()
+
+        messages = [entry.args[0] for entry in log.call_args_list]
+        self.assertEqual(messages, ["未找到可进入的课程", "等待课程中……"])
+
+    def test_entering_class_resets_waiting_message_state(self):
+        classroom = FakePage(
+            "https://changjiang.yuketang.cn/lesson/fullscreen/v3/123/ppt/21",
+            {'section[class*="slide__cmp"]': [FakeItem()]},
+        )
+        bot = make_bot([classroom])
+        bot._waiting_for_class_logged = True
+
+        with patch.object(bot, "_run_classroom_loop", wraps=bot._run_classroom_loop):
+            bot.stop_event = cast(Any, StoppingEvent())
+            bot._get_into_class()
+
+        self.assertFalse(bot._waiting_for_class_logged)
+
     def test_homepage_is_never_a_classroom(self):
         page = FakePage(
             "https://changjiang.yuketang.cn/v2/web/index",
@@ -409,6 +460,87 @@ class ClassroomPageTests(unittest.TestCase):
 
         self.assertIs(bot._find_classroom_in_pages(announce=False), ppt)
 
+    def test_exercise_page_detects_end_signal_from_same_lesson_ppt(self):
+        ended_selector = (
+            '//div[@title="下课啦！" and contains(@class, "timeline__msg")]'
+        )
+        exercise = FakePage(
+            "https://changjiang.yuketang.cn/lesson/fullscreen/v3/123/exercise/20",
+            {'section[class*="slide__cmp"]': [FakeItem()]},
+        )
+        ppt = FakePage(
+            "https://changjiang.yuketang.cn/lesson/fullscreen/v3/123/ppt/30",
+            {
+                '[class*="timeline__"]': [FakeItem()],
+                ended_selector: [FakeItem()],
+            },
+        )
+        other_lesson = FakePage(
+            "https://changjiang.yuketang.cn/lesson/fullscreen/v3/456/ppt/1",
+            {'section[class*="slide__cmp"]': [FakeItem()]},
+        )
+        bot = make_bot([exercise, ppt, other_lesson])
+
+        with (
+            patch.object(bot, "_open_new_quiz") as open_quiz,
+            patch.object(bot, "_check_and_sign_in") as sign_in,
+            patch.object(bot, "_answer") as answer,
+        ):
+            bot._run_classroom_loop(as_page(exercise))
+
+        self.assertTrue(exercise.closed)
+        self.assertTrue(ppt.closed)
+        self.assertFalse(other_lesson.closed)
+        self.assertIn("123", bot._ended_lesson_ids)
+        open_quiz.assert_not_called()
+        sign_in.assert_not_called()
+        answer.assert_not_called()
+
+    def test_close_failure_does_not_allow_ended_lesson_to_be_reentered(self):
+        ended_selector = (
+            '//div[@title="下课啦！" and contains(@class, "timeline__msg")]'
+        )
+        stale = FakePage(
+            "https://changjiang.yuketang.cn/lesson/fullscreen/v3/123/ppt/30",
+            {
+                '[class*="timeline__"]': [FakeItem()],
+                ended_selector: [FakeItem()],
+            },
+            close_error=RuntimeError("page is busy"),
+        )
+        bot = make_bot([stale])
+
+        with patch.object(bot, "log") as log:
+            bot._run_classroom_loop(as_page(stale))
+
+        self.assertFalse(stale.closed)
+        self.assertEqual(stale.close_calls, 1)
+        self.assertIn("123", bot._ended_lesson_ids)
+        self.assertIsNone(bot._find_classroom_in_pages(announce=False))
+        messages = [entry.args[0] for entry in log.call_args_list]
+        self.assertEqual(messages.count("检测到下课啦！自动答题已停止。"), 1)
+
+    def test_class_end_abandons_pending_answer(self):
+        ended_selector = (
+            '//div[@title="下课啦！" and contains(@class, "timeline__msg")]'
+        )
+        page = FakePage(
+            "https://changjiang.yuketang.cn/lesson/fullscreen/v3/123/ppt/30",
+            {ended_selector: [FakeItem()]},
+        )
+        ai = FakeAI(complete=False)
+        bot = make_bot([page], ai=ai)
+        pending = Future()
+        bot._answer_future = pending
+        bot._answer_question_id = "question-1"
+        bot._question_states["question-1"] = ("inflight", time.time(), 1)
+
+        bot._run_classroom_loop(as_page(page))
+
+        self.assertTrue(pending.cancelled())
+        self.assertIsNone(bot._answer_future)
+        self.assertEqual(bot._question_states["question-1"][0], "failed")
+
 
 class BrowserManagerPageTests(unittest.TestCase):
     def test_debug_port_is_local_only(self):
@@ -433,6 +565,63 @@ class BrowserManagerPageTests(unittest.TestCase):
         browser = BrowserManager()
         with self.assertRaises(RuntimeError):
             browser.use_page(as_page(FakePage("about:blank", closed=True)))
+
+    def test_ensure_running_reuses_live_page_after_current_page_closes(self):
+        home = FakePage("https://changjiang.yuketang.cn/v2/web/index")
+        closed_classroom = FakePage(
+            "https://changjiang.yuketang.cn/lesson/fullscreen/v3/123/ppt/30",
+            closed=True,
+        )
+
+        class ConnectedBrowser:
+            @staticmethod
+            def is_connected():
+                return True
+
+        class ExistingContext:
+            def __init__(self):
+                self.pages = [home, closed_classroom]
+                self.new_page_calls = 0
+
+            def new_page(self):
+                self.new_page_calls += 1
+                return FakePage("about:blank")
+
+        context = ExistingContext()
+        browser = BrowserManager()
+        browser._browser = cast(Any, ConnectedBrowser())
+        browser._context = cast(Any, context)
+        browser._page = as_page(closed_classroom)
+
+        self.assertTrue(browser.ensure_running())
+        self.assertIs(browser.page, home)
+        self.assertTrue(home.front)
+        self.assertEqual(context.new_page_calls, 0)
+
+    def test_refresh_without_argument_reloads_current_page(self):
+        current = FakePage("https://changjiang.yuketang.cn/v2/web/index")
+        browser = BrowserManager()
+        browser._page = as_page(current)
+
+        with patch.object(browser, "ensure_running", return_value=True):
+            self.assertTrue(browser.refresh())
+
+        self.assertEqual(current.reload_calls, 1)
+
+    def test_refresh_can_reload_specific_page_without_switching_current_page(self):
+        current = FakePage("https://changjiang.yuketang.cn/v2/web/index")
+        target = FakePage(
+            "https://changjiang.yuketang.cn/lesson/fullscreen/v3/123/ppt/21"
+        )
+        browser = BrowserManager()
+        browser._page = as_page(current)
+
+        with patch.object(browser, "ensure_running", return_value=True):
+            self.assertTrue(browser.refresh(as_page(target)))
+
+        self.assertEqual(target.reload_calls, 1)
+        self.assertEqual(current.reload_calls, 0)
+        self.assertIs(browser.page, current)
 
 
 class QuestionStateTests(unittest.TestCase):

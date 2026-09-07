@@ -201,7 +201,18 @@ class BrowserManager:
             if self._page is None or self._page.is_closed():
                 if self._context is None:
                     return False
-                self._page = self._context.new_page()
+                # 当前课堂页被关闭后，优先复用仍存在的首页或其他标签页，
+                # 避免额外新建 about:blank 并产生重复首页标签。
+                for candidate in reversed(self._context.pages):
+                    try:
+                        if candidate.is_closed():
+                            continue
+                        self.use_page(candidate)
+                        break
+                    except Exception:
+                        continue
+                else:
+                    self._page = self._context.new_page()
         except Exception:
             return False
         return True
@@ -300,6 +311,21 @@ class BrowserManager:
             return True
         except Exception as e:
             logger.error(f"导航到雨课堂失败：{e}")
+            return False
+
+    def refresh(self, page: Optional[Page] = None) -> bool:
+        """刷新指定标签页；未指定时刷新当前由管理器聚焦的标签页。"""
+        if not self.ensure_running():
+            return False
+        try:
+            target = page if page is not None else self.page
+            if target.is_closed():
+                raise RuntimeError("无法刷新已关闭的标签页。")
+            target.reload(timeout=30_000)
+            logger.info("标签页已刷新：%s", target.url[:120])
+            return True
+        except Exception as e:
+            logger.error("刷新标签页失败：%s", e)
             return False
 
     def is_logged_in(self) -> bool:

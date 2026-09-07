@@ -28,6 +28,9 @@ RETRY_DELAY = 10
 # 点击课程后，课堂页可能需要等待后端创建并完成首屏渲染。
 CLASSROOM_OPEN_TIMEOUT = 20
 
+# 雨课堂下课后会把该消息永久保留在课堂时间线中。
+CLASS_ENDED_SELECTOR = '//div[@title="下课啦！" and contains(@class, "timeline__msg")]'
+
 # Cookie 有效期（天）—— 与 main.py 中的显示共用，抽成单一常量避免两处硬编码
 COOKIE_VALID_DAYS = 14
 
@@ -61,6 +64,8 @@ class Bot:
         self._answer_exercise_path = ""
         self._last_unidentified_log = 0.0  # 「无法识别题目」日志节流
         self._exercise_html_saved = False
+        self._ended_lesson_ids: set[str] = set()
+        self._waiting_for_class_logged = False
 
     def log(self, message: str) -> None:
         """统一日志输出（只 emit 一次）。
@@ -170,6 +175,14 @@ class Bot:
 
     # ==================== 课程检测 ====================
 
+    def _log_waiting_for_class_once(self) -> None:
+        """每个等待课程阶段只输出一次状态，后台检测照常继续。"""
+        if self._waiting_for_class_logged:
+            return
+        self._waiting_for_class_logged = True
+        self.log("未找到可进入的课程")
+        self.log("等待课程中……")
+
     def _get_into_class(self) -> None:
         """进入正在进行的课程——优先复用已有课堂标签页，没有才重新导航。"""
         while not self.stop_event.is_set():
@@ -200,7 +213,6 @@ class Bot:
             page = self.browser.page
             self._debug_dump(page, "main-page")
 
-            self.log("正在检查是否有正在进行的课程...")
             onlesson_selector = ".onlesson"
 
             try:
@@ -215,7 +227,7 @@ class Bot:
                     return
 
                 if not self._click_active_class(page):
-                    self.log("检测到上课汇总栏，但没有找到可进入的具体课程。")
+                    self._log_waiting_for_class_once()
                     return
 
                 # 新标签页和同页跳转都轮询验证，不等待经常无法达到的 networkidle。
@@ -241,11 +253,11 @@ class Bot:
                     return
 
                 # 首页不是课堂；失败后交给下一轮重新发现，不能在首页死循环。
-                self.log("未找到可验证的课堂页面，本轮停止进入课堂。")
+                self._log_waiting_for_class_once()
                 return
 
             except PlaywrightTimeout:
-                self.log("你现在没课。")
+                self._log_waiting_for_class_once()
                 return
             except Exception as e:
                 self.log(f"课程检测发生错误：{e}，{RETRY_DELAY} 秒后重试...")
@@ -287,6 +299,9 @@ class Bot:
         candidates = []
         for index, page in enumerate(self.browser.pages):
             try:
+                lesson_id = self._lesson_id_from_url(page.url)
+                if lesson_id and lesson_id in self._ended_lesson_ids:
+                    continue
                 if self._is_classroom_page(page):
                     is_ppt = bool(re.search(r"/ppt/\d+(?:[/?#]|$)", page.url.lower()))
                     candidates.append((is_ppt, index, page))
@@ -416,8 +431,80 @@ class Bot:
                 continue
         return False
 
+    @staticmethod
+    def _lesson_id_from_url(url: str) -> str:
+        """从雨课堂课堂 URL 中提取 lesson ID。"""
+        try:
+            path = urlsplit(url).path.lower()
+        except Exception:
+            return ""
+        match = re.search(r"/lesson/(?:fullscreen/v\d+/)?(\d+)(?:/|$)", path)
+        return match.group(1) if match else ""
+
+    def _pages_for_lesson(self, lesson_id: str, current_page: Page) -> list[Page]:
+        """返回同一 lesson 的全部页面；无法提取 ID 时仅处理当前页。"""
+        if not lesson_id:
+            return [current_page]
+
+        pages: list[Page] = []
+        try:
+            candidates = tuple(self.browser.pages)
+        except Exception:
+            candidates = ()
+        for candidate in candidates:
+            try:
+                if self._lesson_id_from_url(candidate.url) == lesson_id:
+                    pages.append(candidate)
+            except Exception:
+                continue
+        if not any(candidate is current_page for candidate in pages):
+            pages.append(current_page)
+        return pages
+
+    @staticmethod
+    def _has_class_ended_signal(page: Page) -> bool:
+        try:
+            return page.locator(CLASS_ENDED_SELECTOR).count() > 0
+        except Exception:
+            return False
+
+    def _handle_class_ended(self, current_page: Page) -> bool:
+        """检测同 lesson 的下课消息，并让该课程在本进程内永久收敛。"""
+        try:
+            lesson_id = self._lesson_id_from_url(current_page.url)
+        except Exception:
+            lesson_id = ""
+        lesson_pages = self._pages_for_lesson(lesson_id, current_page)
+        if not any(self._has_class_ended_signal(page) for page in lesson_pages):
+            return False
+
+        # 必须先标记再关闭。即使某个 close() 失败，标签页发现流程也不会
+        # 再次把这个已经结束的 lesson 当作正在进行的课堂。
+        if lesson_id:
+            self._ended_lesson_ids.add(lesson_id)
+        if self._answer_future is not None:
+            self._abandon_pending_answer("检测到下课")
+
+        self.log("检测到下课啦！自动答题已停止。")
+        closed = 0
+        failed = 0
+        for page in lesson_pages:
+            try:
+                page.close()
+                closed += 1
+            except Exception as exc:
+                failed += 1
+                logger.warning("关闭已结束课堂标签页失败：%s", exc)
+
+        lesson_label = lesson_id or "当前课堂"
+        self.log(f"已清理课程 {lesson_label} 的 {closed} 个标签页。")
+        if failed:
+            self.log(f"另有 {failed} 个课堂标签页关闭失败，后续将忽略这些页面。")
+        return True
+
     def _run_classroom_loop(self, page: Page) -> None:
         """在课堂页面内循环签到/答题直到下课。"""
+        self._waiting_for_class_logged = False
         self.browser.use_page(page)
         self._last_classroom_url = ""
         self.log("我去上课啦！")
@@ -427,6 +514,11 @@ class Bot:
         while not self.stop_event.is_set():
             quiz_interval = self._int_setting("quiz_refresh_interval", 1, 1, 300)
             try:
+                # 当前页可能是没有 timeline 的 exercise；必须扫描同 lesson 的
+                # PPT/入口页，才能及时收到老师结束课堂的消息。
+                if self._handle_class_ended(page):
+                    return
+
                 if page.is_closed():
                     self.log("课堂标签页已关闭，返回课程发现流程。")
                     return
@@ -460,12 +552,6 @@ class Bot:
                     self.browser.use_page(page)
                     self.log(f"已跟随到新的课堂标签页：{page.url[:100]}")
 
-                if page.locator(
-                    '//div[@title="下课啦！" and contains(@class, "timeline__msg")]'
-                ).count() > 0:
-                    self.log("检测到下课啦！自动答题已停止。")
-                    return
-
                 cur = page.url
                 if cur and cur != self._last_classroom_url:
                     self._last_classroom_url = cur
@@ -491,6 +577,12 @@ class Bot:
         existing_ids = {id(page) for page in existing_pages}
         for candidate in reversed(self.browser.pages):
             if id(candidate) in existing_ids:
+                continue
+            try:
+                lesson_id = self._lesson_id_from_url(candidate.url)
+            except Exception:
+                lesson_id = ""
+            if lesson_id and lesson_id in self._ended_lesson_ids:
                 continue
             if self._is_classroom_page(candidate):
                 return candidate
