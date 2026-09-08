@@ -7,7 +7,7 @@ from unittest.mock import mock_open, patch
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
-from src.bot import Bot
+from src.bot import Bot, CLASS_ENDED_SELECTOR
 from src.browser import BrowserManager
 
 
@@ -139,6 +139,7 @@ class FakeBrowser:
         self.pages = pages or []
         self.current = self.pages[0] if self.pages else None
         self.navigate_calls = 0
+        self.refresh_calls = 0
 
     @property
     def page(self):
@@ -151,6 +152,10 @@ class FakeBrowser:
 
     def navigate_to_class(self):
         self.navigate_calls += 1
+        return True
+
+    def refresh(self, page=None):
+        self.refresh_calls += 1
         return True
 
     def use_page(self, page):
@@ -1072,6 +1077,139 @@ class AnswerActionTests(unittest.TestCase):
             parse('{"type":"unknown","answers":"A"}'),
             ("unknown", [], ""),
         )
+
+
+class TabLeakGuardTests(unittest.TestCase):
+    """下课/进课链路的标签页泄漏防护。"""
+
+    def _make_home_bot(self):
+        home = FakePage("https://changjiang.yuketang.cn/v2/web/index")
+        browser = FakeBrowser([home])
+        bot = make_bot()
+        bot.browser = cast(Any, browser)
+        return bot, browser, home
+
+    def test_stale_home_page_is_refreshed_periodically(self):
+        bot, browser, home = self._make_home_bot()
+
+        def no_active_class(selector, timeout=None):
+            raise PlaywrightTimeout("no active class")
+
+        home.wait_for_selector = no_active_class
+        with patch.object(bot, "log"):
+            bot._get_into_class()  # _home_refreshed_at=0 → 立即刷新一次
+            self.assertEqual(browser.refresh_calls, 1)
+            bot._get_into_class()  # 刚刷新过 → 不再刷新
+        self.assertEqual(browser.refresh_calls, 1)
+
+    def test_navigate_counts_as_home_refresh(self):
+        stale = FakePage("https://changjiang.yuketang.cn/lesson/fullscreen/v3/1")
+        bot = make_bot([stale])
+
+        with patch.object(bot, "log"):
+            bot._get_into_class()
+
+        self.assertEqual(bot.browser.navigate_calls, 1)
+        self.assertEqual(bot.browser.refresh_calls, 0)
+        self.assertGreater(bot._home_refreshed_at, 0.0)
+
+    def test_click_timeout_closes_tab_opened_this_round(self):
+        bot, browser, home = self._make_home_bot()
+        stray = FakePage("https://changjiang.yuketang.cn/web/?index")
+
+        def click_opens_stray(page):
+            browser.pages.append(stray)
+            return True
+
+        with (
+            patch.object(bot, "_click_active_class", side_effect=click_opens_stray),
+            patch.object(bot, "_wait_for_classroom_page", return_value=None),
+            patch.object(bot, "log") as log,
+        ):
+            bot._get_into_class()
+
+        self.assertEqual(stray.close_calls, 1)
+        self.assertEqual(home.close_calls, 0)
+        messages = [entry.args[0] for entry in log.call_args_list]
+        self.assertIn("未识别出课堂，已关闭本轮新打开的 1 个标签页。", messages)
+
+    def test_classroom_in_new_tab_is_kept(self):
+        bot, browser, home = self._make_home_bot()
+        classroom = FakePage(
+            "https://changjiang.yuketang.cn/lesson/fullscreen/v3/777/ppt/1",
+            {'section[class*="slide__cmp"]': [FakeItem()]},
+        )
+
+        def click_opens_classroom(page):
+            browser.pages.append(classroom)
+            return True
+
+        with (
+            patch.object(
+                bot, "_click_active_class", side_effect=click_opens_classroom
+            ),
+            patch.object(bot, "_run_classroom_loop") as loop,
+        ):
+            bot._get_into_class()
+
+        self.assertEqual(classroom.close_calls, 0)
+        loop.assert_called_once_with(classroom)
+
+    def test_click_failure_still_closes_opened_tab(self):
+        bot, browser, home = self._make_home_bot()
+        stray = FakePage("https://changjiang.yuketang.cn/web/?index")
+
+        def click_dispatched_but_failed(page):
+            browser.pages.append(stray)
+            return False
+
+        with (
+            patch.object(
+                bot, "_click_active_class", side_effect=click_dispatched_but_failed
+            ),
+            patch.object(bot, "log"),
+        ):
+            bot._get_into_class()
+
+        self.assertEqual(stray.close_calls, 1)
+
+    def test_tab_limit_blocks_entry_click(self):
+        bot, browser, home = self._make_home_bot()
+        filler = [
+            FakePage(f"https://changjiang.yuketang.cn/web/?index#{i}")
+            for i in range(4)
+        ]
+        browser.pages.extend(filler)  # 共 5 个 → 达到上限
+
+        with (
+            patch.object(bot, "_click_active_class") as click_course,
+            patch.object(bot, "log") as log,
+        ):
+            bot._get_into_class()
+
+        click_course.assert_not_called()
+        messages = [entry.args[0] for entry in log.call_args_list]
+        self.assertTrue(any("标签页数量已达 5 个" in m for m in messages))
+        for page in filler:
+            self.assertEqual(page.close_calls, 0)
+
+    def test_class_end_refreshes_home_page(self):
+        home = FakePage("https://changjiang.yuketang.cn/v2/web/index")
+        classroom = FakePage(
+            "https://changjiang.yuketang.cn/lesson/fullscreen/v3/999/ppt/30",
+            {CLASS_ENDED_SELECTOR: [FakeItem()]},
+        )
+        browser = FakeBrowser([home, classroom])
+        bot = make_bot()
+        bot.browser = cast(Any, browser)
+
+        self.assertTrue(bot._handle_class_ended(as_page(classroom)))
+
+        self.assertEqual(classroom.close_calls, 1)
+        self.assertEqual(browser.refresh_calls, 1)
+        self.assertIs(browser.current, home)
+        self.assertIn("999", bot._ended_lesson_ids)
+        self.assertGreater(bot._home_refreshed_at, 0.0)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,20 @@ logger = logging.getLogger(__name__)
 RETRY_DELAY = 10
 
 # 点击课程后，课堂页可能需要等待后端创建并完成首屏渲染。
-CLASSROOM_OPEN_TIMEOUT = 20
+# 60 秒：等待期间不产生新调用；超时后关闭本轮新开的标签页。
+CLASSROOM_OPEN_TIMEOUT = 60
+
+# 首页 DOM 刷新间隔（秒）。首页在上课期间加载后不会自动更新，已结束
+# 课程的任务条会一直留在已渲染的 DOM 里，导致主循环反复点击已结束的
+# 课程并每次泄漏一个标签页，因此必须定期强制刷新让它反映服务器真相。
+HOME_REFRESH_INTERVAL = 600
+
+# 进入课程的标签页数上限（保险丝）。正常课堂只有 2-3 个标签页
+# （习题是同页导航），达到上限说明出现异常堆积：暂停进入并告警。
+MAX_ENTRY_TABS = 5
+
+# 标签页超限警告的节流间隔（秒）。
+TAB_LIMIT_WARN_INTERVAL = 300
 
 # 雨课堂下课后会把该消息永久保留在课堂时间线中。
 CLASS_ENDED_SELECTOR = '//div[@title="下课啦！" and contains(@class, "timeline__msg")]'
@@ -66,6 +79,8 @@ class Bot:
         self._exercise_html_saved = False
         self._ended_lesson_ids: set[str] = set()
         self._waiting_for_class_logged = False
+        self._home_refreshed_at = 0.0  # 首页最近一次刷新/导航的时刻（monotonic）
+        self._last_tab_limit_warn = 0.0  # 标签页超限警告节流
 
     def log(self, message: str) -> None:
         """统一日志输出（只 emit 一次）。
@@ -209,6 +224,12 @@ class Bot:
                 if not self.browser.navigate_to_class():
                     self.stop_event.wait(RETRY_DELAY)
                     continue
+                self._home_refreshed_at = time.monotonic()
+            elif time.monotonic() - self._home_refreshed_at >= HOME_REFRESH_INTERVAL:
+                # 定时刷新首页：已渲染的 DOM 不会随下课自动更新（见常量注释）。
+                # 刷新失败不阻塞本轮，下一轮会重试。
+                if self.browser.refresh(self.browser.page):
+                    self._home_refreshed_at = time.monotonic()
 
             page = self.browser.page
             self._debug_dump(page, "main-page")
@@ -226,7 +247,16 @@ class Bot:
                     self._run_classroom_loop(classroom_page)
                     return
 
+                # 标签页保险丝：点击课程条会真实打开新标签页，数量异常时
+                # 先停止进入并告警，防止泄漏进一步扩大。
+                if len(self.browser.pages) >= MAX_ENTRY_TABS:
+                    self._warn_tab_limit()
+                    return
+
+                pages_before_click = self._snapshot_pages()
                 if not self._click_active_class(page):
+                    # click() 半途抛异常但页面可能已被打开，同样要做 diff 清理。
+                    self._close_pages_opened_after(pages_before_click)
                     self._log_waiting_for_class_once()
                     return
 
@@ -252,7 +282,9 @@ class Bot:
                     self._run_classroom_loop(classroom_page)
                     return
 
-                # 首页不是课堂；失败后交给下一轮重新发现，不能在首页死循环。
+                # 首页不是课堂；关闭本轮新开的标签页后交给下一轮重新发现，
+                # 不能在首页死循环，更不能让点击产生的标签页累积。
+                self._close_pages_opened_after(pages_before_click)
                 self._log_waiting_for_class_once()
                 return
 
@@ -500,7 +532,71 @@ class Bot:
         self.log(f"已清理课程 {lesson_label} 的 {closed} 个标签页。")
         if failed:
             self.log(f"另有 {failed} 个课堂标签页关闭失败，后续将忽略这些页面。")
+        # 根本手段：立即刷新主页，让课程条马上反映"课已结束"的服务器真相，
+        # 否则上课期间渲染的首页 DOM 会残留课程条，主循环会反复点击它。
+        self._refresh_home_after_class()
         return True
+
+    def _snapshot_pages(self) -> list:
+        """点击前快照现有标签页，用于之后识别本轮新开的页面。"""
+        try:
+            return list(self.browser.pages)
+        except Exception:
+            return []
+
+    def _close_pages_opened_after(self, before: list) -> None:
+        """关闭快照之后新打开且未被识别为课堂的标签页（防泄漏）。"""
+        try:
+            current = list(self.browser.pages)
+        except Exception:
+            return
+        before_ids = {id(page) for page in before}
+        opened = [page for page in current if id(page) not in before_ids]
+        closed = 0
+        for candidate in opened:
+            try:
+                if candidate.is_closed():
+                    continue
+                candidate.close()
+                closed += 1
+            except Exception as exc:
+                logger.warning("关闭本轮新开标签页失败：%s", exc)
+        if closed:
+            self.log(f"未识别出课堂，已关闭本轮新打开的 {closed} 个标签页。")
+
+    def _warn_tab_limit(self) -> None:
+        """标签页达到上限时的节流警告；只警告不自动关闭。"""
+        now = time.monotonic()
+        if now - self._last_tab_limit_warn < TAB_LIMIT_WARN_INTERVAL:
+            return
+        self._last_tab_limit_warn = now
+        self.log(
+            f"标签页数量已达 {len(self.browser.pages)} 个"
+            f"（上限 {MAX_ENTRY_TABS}），跳过进入课程以防泄漏，请检查浏览器。"
+        )
+
+    def _refresh_home_after_class(self) -> None:
+        """下课关闭课堂标签页后立即刷新主页。
+
+        没有存活的首页标签页时跳过：下一轮检测会新建页面并导航，
+        天然是新鲜 DOM。
+        """
+        home_page = None
+        try:
+            for candidate in reversed(self.browser.pages):
+                if not candidate.is_closed() and self._is_home_page(candidate):
+                    home_page = candidate
+                    break
+        except Exception:
+            home_page = None
+        if home_page is None:
+            return
+        try:
+            self.browser.use_page(home_page)
+        except Exception:
+            pass
+        if self.browser.refresh(home_page):
+            self._home_refreshed_at = time.monotonic()
 
     def _run_classroom_loop(self, page: Page) -> None:
         """在课堂页面内循环签到/答题直到下课。"""
