@@ -12,14 +12,14 @@ import customtkinter as ctk
 
 from src.ai import AIService
 from src.bot import Bot, COOKIE_VALID_DAYS
-from src.browser import BrowserManager
+from src.browser import DEFAULT_SERVER, YUKETANG_SERVERS, BrowserManager
 from src.config import Config
 from src.instance_lock import InstanceLock
 from src.notification import NotificationService
 
 # ==================== 全局配置 ====================
 
-APP_TITLE = "长江雨课堂自动助手"
+APP_TITLE = "雨课堂自动助手"
 APP_WIDTH = 900
 APP_HEIGHT = 700
 APP_MIN_W = 600
@@ -140,6 +140,7 @@ class App(ctk.CTk):
         self._cookie_stop_event = threading.Event()
         self._save_job: str | None = None  # 实时保存的防抖 after 任务 id
         self._last_save_error_log = 0.0  # 保存失败日志的节流
+        self._active_server = self.config.get("yuketang_server", DEFAULT_SERVER)
 
         # ---- 构建 UI ----
         self._setup_ui()
@@ -289,6 +290,16 @@ class App(ctk.CTk):
         scroll = ctk.CTkScrollableFrame(parent, label_text="")
         scroll.pack(expand=True, fill="both", padx=10, pady=10)
 
+        # ---- 雨课堂服务器 ----
+        self._section_label(scroll, "🏫 雨课堂服务器")
+        self.yuketang_server_var = self._combo_row(
+            scroll,
+            "服务器",
+            list(YUKETANG_SERVERS),
+            self.config.get("yuketang_server", DEFAULT_SERVER),
+        )
+        self.yuketang_server_var.trace_add("write", self._on_server_changed)
+
         # ---- 时间设置 ----
         self._section_label(scroll, "⏰ 时间设置")
         self.start_time_var, _ = self._entry_row(scroll, "每日开始时间", self.config.get("start_time", "07:00"))
@@ -372,6 +383,7 @@ class App(ctk.CTk):
         # 任一设置变化后自动写盘（防抖见 _on_setting_changed），
         # 不再需要「保存设置」按钮。
         for var in (
+            self.yuketang_server_var,
             self.start_time_var,
             self.end_time_var,
             self.headless_var,
@@ -542,7 +554,11 @@ class App(ctk.CTk):
 
     def _get_cookies(self) -> None:
         self._log("正在打开浏览器以获取登录 Cookies...")
-        temp_bm = BrowserManager(headless=False)
+        server = self.config.get("yuketang_server", DEFAULT_SERVER)
+        temp_bm = BrowserManager(
+            headless=False,
+            base_url=YUKETANG_SERVERS.get(server, YUKETANG_SERVERS[DEFAULT_SERVER]),
+        )
         if temp_bm.get_cookies(
             timeout_ms=120_000, stop_event=self._cookie_stop_event
         ):
@@ -586,6 +602,7 @@ class App(ctk.CTk):
 
     def _collect_settings(self) -> dict:
         return {
+            "yuketang_server": self.yuketang_server_var.get(),
             "start_time": self.start_time_var.get(),
             "end_time": self.end_time_var.get(),
             "headless_mode": self.headless_var.get(),
@@ -603,6 +620,17 @@ class App(ctk.CTk):
             "quiz_refresh_interval": int(self.quiz_refresh_interval_var.get()),
             "xxtui_api_key": self.xxtui_key_var.get(),
         }
+
+    def _on_server_changed(self, *_args) -> None:
+        """切换雨课堂服务器时提示重新登录（各服务器登录态按域名隔离）。"""
+        name = self.yuketang_server_var.get()
+        if name == self._active_server:
+            return
+        self._active_server = name
+        self._log(
+            f"雨课堂服务器已切换为「{name}」。各服务器登录态相互独立，"
+            "请重新获取登录 Cookies。"
+        )
 
     def _on_setting_changed(self, *_args) -> None:
         """任一设置变化后防抖 500ms 再写盘，避免逐键触发。"""
@@ -645,7 +673,11 @@ class App(ctk.CTk):
             return
 
         headless = self.config.get("headless_mode", False)
-        self.browser = BrowserManager(headless=headless)
+        server = self.config.get("yuketang_server", DEFAULT_SERVER)
+        self.browser = BrowserManager(
+            headless=headless,
+            base_url=YUKETANG_SERVERS.get(server, YUKETANG_SERVERS[DEFAULT_SERVER]),
+        )
         self.stop_event = threading.Event()
         ai_service = AIService(self.config)
 

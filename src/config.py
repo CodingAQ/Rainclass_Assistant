@@ -58,8 +58,12 @@ DEFAULTS: dict[str, Any] = {
     "xxtui_api_key": "",
     "last_cookie_warn_date": "",
     "last_cookie_update_time": "",
+    "yuketang_server": "长江雨课堂",  # 雨课堂服务器（URL 映射见 browser.YUKETANG_SERVERS）
     "debug_mode": False,  # 调试模式：保存 HTML/截图/tab 列表到 debug/
 }
+
+# 雨课堂服务器合法取值（与 browser.YUKETANG_SERVERS 保持一致）
+YUKETANG_SERVER_NAMES = ("雨课堂", "荷塘雨课堂", "长江雨课堂", "黄河雨课堂")
 
 TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
@@ -153,6 +157,12 @@ class Config:
         ai_model = settings.get("ai_model")
         if ai_model not in ("豆包AI", "Gemini AI", "自定义", "多AI作答"):
             errors.append("AI 模型必须是：豆包AI / Gemini AI / 自定义 / 多AI作答")
+
+        # 雨课堂服务器合法性
+        if settings.get("yuketang_server") not in YUKETANG_SERVER_NAMES:
+            errors.append(
+                "雨课堂服务器必须是：" + " / ".join(YUKETANG_SERVER_NAMES)
+            )
         if ai_model == "多AI作答" and not str(
             settings.get("multi_ai_config_path", "")
         ).strip():

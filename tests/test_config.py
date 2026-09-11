@@ -20,6 +20,26 @@ class ConfigPersistenceTests(unittest.TestCase):
             settings["multi_ai_timeout"] = 0
             self.assertIn("multi_ai_timeout 范围应为 1~300", config.save(settings))
 
+    def test_yuketang_server_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(os.path.join(directory, "config.json"))
+            settings = config.to_dict()
+
+            settings["yuketang_server"] = "黄河雨课堂"
+            self.assertEqual(config.save(settings), [])
+            self.assertEqual(config.get("yuketang_server"), "黄河雨课堂")
+
+            settings["yuketang_server"] = "火星雨课堂"
+            self.assertIn(
+                "雨课堂服务器必须是：雨课堂 / 荷塘雨课堂 / 长江雨课堂 / 黄河雨课堂",
+                config.save(settings),
+            )
+
+    def test_yuketang_server_defaults_to_changjiang(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(os.path.join(directory, "config.json"))
+            self.assertEqual(config.get("yuketang_server"), "长江雨课堂")
+
     def test_save_writes_valid_config_without_leaving_temp_file(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "config.json")

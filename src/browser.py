@@ -18,8 +18,18 @@ logger = logging.getLogger(__name__)
 # 默认会话状态文件（存储 cookies + localStorage）
 DEFAULT_STATE_FILE = "browser_state.json"
 
-# 雨课堂域名
-YUKETANG_URL = "https://changjiang.yuketang.cn"
+# 雨课堂各服务器主页。域名以官方帮助页为准（荷塘雨课堂 = pro.yuketang.cn）：
+# https://www.yuketang.cn/help?detail=508
+YUKETANG_SERVERS: dict[str, str] = {
+    "雨课堂": "https://www.yuketang.cn",
+    "荷塘雨课堂": "https://pro.yuketang.cn",
+    "长江雨课堂": "https://changjiang.yuketang.cn",
+    "黄河雨课堂": "https://huanghe.yuketang.cn",
+}
+DEFAULT_SERVER = "长江雨课堂"
+
+# 旧常量：默认服务器域名（实际导航地址由 BrowserManager.base_url 决定）
+YUKETANG_URL = YUKETANG_SERVERS[DEFAULT_SERVER]
 
 
 # 模块级缓存：Playwright 浏览器安装检测只做一次，避免每次 start() 都 launch 验证
@@ -72,10 +82,13 @@ class BrowserManager:
         headless: bool = False,
         state_file: str = DEFAULT_STATE_FILE,
         debug_port: Optional[int] = None,
+        base_url: Optional[str] = None,
     ):
         self._headless = headless
         self._state_file = state_file
         self._debug_port = self._resolve_debug_port(debug_port)
+        # 导航主页地址：按所配雨课堂服务器决定（见 YUKETANG_SERVERS）
+        self.base_url = (base_url or YUKETANG_URL).rstrip("/")
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
@@ -241,7 +254,7 @@ class BrowserManager:
             browser = pw.chromium.launch(headless=False)
             context = browser.new_context(viewport={"width": 1280, "height": 720})
             page = context.new_page()
-            page.goto(YUKETANG_URL)
+            page.goto(self.base_url)
 
             # 轮询登录标记，使应用关闭时可以取消等待。
             logger.info("等待用户完成登录（最长 120 秒）...")
@@ -305,7 +318,7 @@ class BrowserManager:
             self._page = self._context.new_page()
 
         try:
-            self.page.goto(YUKETANG_URL, timeout=30_000)
+            self.page.goto(self.base_url, timeout=30_000)
             self.page.wait_for_selector("body", timeout=20_000)
             logger.info("已成功导航到雨课堂。")
             return True
@@ -340,7 +353,7 @@ class BrowserManager:
         """快速检查网络能否连通雨课堂。"""
         try:
             import requests
-            requests.get(YUKETANG_URL, timeout=5)
+            requests.get(self.base_url, timeout=5)
             return True
         except Exception:
             return False

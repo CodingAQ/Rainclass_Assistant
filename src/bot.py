@@ -18,6 +18,8 @@ from datetime import datetime
 from typing import Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
+from src.browser import DEFAULT_SERVER, YUKETANG_SERVERS
+
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 
 logger = logging.getLogger(__name__)
@@ -296,13 +298,24 @@ class Bot:
                 self.stop_event.wait(RETRY_DELAY)
                 continue
 
-    @staticmethod
-    def _is_home_page(page: Page) -> bool:
+    def _server_host(self) -> str:
+        """所配雨课堂服务器的主机名（小写），用于首页/课堂判定。"""
+        name = self.config.get("yuketang_server", DEFAULT_SERVER)
+        return urlsplit(
+            YUKETANG_SERVERS.get(name, YUKETANG_SERVERS[DEFAULT_SERVER])
+        ).netloc.lower()
+
+    def _is_home_page(self, page: Page) -> bool:
+        """是否处于所配服务器的首页（根路径或 v2/web/index）。"""
         try:
-            url = page.url.lower().rstrip("/")
+            parts = urlsplit(page.url.strip())
+            host = parts.netloc.lower()
+            path = parts.path.lower().rstrip("/")
         except Exception:
             return False
-        return url == "https://changjiang.yuketang.cn" or "/v2/web/index" in url
+        if host != self._server_host():
+            return False
+        return path in ("", "/v2/web/index")
 
     def _wait_for_classroom_page(self, timeout: float) -> Optional[Page]:
         """等待课堂页，并持续处理 Playwright 的新页面事件。"""
@@ -434,7 +447,18 @@ class Bot:
         except Exception:
             return False
 
-        if "/v2/web/index" in url or url.rstrip("/") == "https://changjiang.yuketang.cn":
+        if "/v2/web/index" in url:
+            return False
+        # 所配服务器的根路径是首页，不是课堂
+        try:
+            parts = urlsplit(url)
+        except Exception:
+            parts = None
+        if (
+            parts is not None
+            and parts.netloc.lower() == self._server_host()
+            and parts.path in ("", "/")
+        ):
             return False
 
         has_timeline = self._has_any(page, [
@@ -1356,7 +1380,7 @@ class Bot:
                 self.log(f"Cookies 有效期不足 3 天，正在发送微信提醒。")
                 try:
                     self._notify(
-                        "长江雨课堂助手：Cookies 即将过期",
+                        "雨课堂助手：Cookies 即将过期",
                         f"您的登录 Cookies 还剩约 {remaining:.1f} 天过期。请尽快更新 Cookies。",
                     )
                 except Exception as notify_err:

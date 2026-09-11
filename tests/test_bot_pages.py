@@ -165,8 +165,11 @@ class FakeBrowser:
 
 
 class FakeConfig:
+    def __init__(self, values=None):
+        self.values = dict(values or {})
+
     def get(self, key, default=None):
-        return default
+        return self.values.get(key, default)
 
 
 class FakeStopEvent:
@@ -1210,6 +1213,55 @@ class TabLeakGuardTests(unittest.TestCase):
         self.assertIs(browser.current, home)
         self.assertIn("999", bot._ended_lesson_ids)
         self.assertGreater(bot._home_refreshed_at, 0.0)
+
+
+class ServerSelectionTests(unittest.TestCase):
+    """雨课堂服务器选择：主页/课堂判定按所配服务器的域名生效。"""
+
+    def test_home_page_matches_configured_server(self):
+        bot = make_bot()
+        bot.config = cast(Any, FakeConfig({"yuketang_server": "黄河雨课堂"}))
+
+        self.assertTrue(
+            bot._is_home_page(as_page(FakePage("https://huanghe.yuketang.cn")))
+        )
+        self.assertTrue(
+            bot._is_home_page(
+                as_page(FakePage("https://huanghe.yuketang.cn/v2/web/index"))
+            )
+        )
+        # 未配置的服务器域名不算首页
+        self.assertFalse(
+            bot._is_home_page(as_page(FakePage("https://changjiang.yuketang.cn")))
+        )
+
+    def test_default_server_stays_changjiang(self):
+        bot = make_bot()
+
+        self.assertTrue(
+            bot._is_home_page(
+                as_page(FakePage("https://changjiang.yuketang.cn/v2/web/index?x=1"))
+            )
+        )
+        self.assertFalse(
+            bot._is_home_page(as_page(FakePage("https://www.yuketang.cn")))
+        )
+
+    def test_classroom_check_excludes_configured_home(self):
+        bot = make_bot()
+        bot.config = cast(Any, FakeConfig({"yuketang_server": "黄河雨课堂"}))
+
+        home_like = FakePage(
+            "https://huanghe.yuketang.cn",
+            {'[class*="timeline__"]': [FakeItem()]},
+        )
+        self.assertFalse(bot._is_classroom_page(as_page(home_like)))
+
+        lesson = FakePage(
+            "https://huanghe.yuketang.cn/lesson/fullscreen/v3/1/ppt/1",
+            {'section[class*="slide__cmp"]': [FakeItem()]},
+        )
+        self.assertTrue(bot._is_classroom_page(as_page(lesson)))
 
 
 if __name__ == "__main__":
