@@ -2,6 +2,7 @@ import logging
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
@@ -137,6 +138,8 @@ class App(ctk.CTk):
         self._destroying = False
         self._cookie_thread: threading.Thread | None = None
         self._cookie_stop_event = threading.Event()
+        self._save_job: str | None = None  # 实时保存的防抖 after 任务 id
+        self._last_save_error_log = 0.0  # 保存失败日志的节流
 
         # ---- 构建 UI ----
         self._setup_ui()
@@ -144,7 +147,7 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._log("应用已启动。")
-        self._log("请先在「设置」中获取登录 Cookies 并保存配置。")
+        self._log("请先在主页右上角获取登录 Cookies。")
         self._update_cookie_info()
 
     # ==================== 日志 ====================
@@ -248,13 +251,23 @@ class App(ctk.CTk):
         )
         self.toggle_btn.pack(side="left", pady=8)
 
+        self.cookies_btn = ctk.CTkButton(
+            status_bar,
+            text="获取登录Cookie",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            height=36,
+            corner_radius=8,
+            command=self._run_get_cookies,
+        )
+        self.cookies_btn.pack(side="right", padx=(0, 12), pady=8)
+
         self.cookie_status = ctk.CTkLabel(
             status_bar,
             text="Cookies: 未获取",
             font=ctk.CTkFont(size=12),
             text_color="gray",
         )
-        self.cookie_status.pack(side="right", padx=12, pady=10)
+        self.cookie_status.pack(side="right", padx=(0, 10), pady=10)
 
         # 日志区
         self.log_text = ctk.CTkTextbox(
@@ -355,20 +368,28 @@ class App(ctk.CTk):
         self._section_label(scroll, "🔔 微信通知")
         self.xxtui_key_var, _ = self._entry_row(scroll, "xxtui API Key", self.config.get("xxtui_api_key", ""), show="*")
 
-        # ---- 按钮 ----
-        btn_frame = ctk.CTkFrame(scroll, fg_color="transparent")
-        btn_frame.pack(fill="x", pady=(20, 4))
-
-        ctk.CTkButton(
-            btn_frame, text="💾  保存设置", font=ctk.CTkFont(size=14),
-            height=38, corner_radius=8, command=self._save_settings,
-        ).pack(side="left", padx=(0, 10))
-
-        self.cookies_btn = ctk.CTkButton(
-            btn_frame, text="🔑  获取登录 Cookies", font=ctk.CTkFont(size=14),
-            height=38, corner_radius=8, command=self._run_get_cookies,
-        )
-        self.cookies_btn.pack(side="left", padx=(0, 10))
+        # ---- 实时保存 ----
+        # 任一设置变化后自动写盘（防抖见 _on_setting_changed），
+        # 不再需要「保存设置」按钮。
+        for var in (
+            self.start_time_var,
+            self.end_time_var,
+            self.headless_var,
+            self.debug_var,
+            self.ai_model_var,
+            self.doubao_key_var,
+            self.gemini_key_var,
+            self.custom_base_url_var,
+            self.custom_api_key_var,
+            self.custom_model_var,
+            self.multi_ai_path_var,
+            self.multi_ai_timeout_var,
+            self.submit_delay_var,
+            self.check_interval_var,
+            self.quiz_refresh_interval_var,
+            self.xxtui_key_var,
+        ):
+            var.trace_add("write", self._on_setting_changed)
 
     # ---- 设置行构建器 ----
 
@@ -497,7 +518,7 @@ class App(ctk.CTk):
         if self._cookie_thread and self._cookie_thread.is_alive():
             self._log("登录 Cookies 正在获取中，请完成当前登录窗口。")
             return
-        self.cookies_btn.configure(state="disabled", text="⏳  等待登录")
+        self.cookies_btn.configure(state="disabled", text="⏳ 等待登录")
         self._cookie_stop_event.clear()
 
         def run() -> None:
@@ -515,7 +536,7 @@ class App(ctk.CTk):
     def _finish_cookie_task(self) -> None:
         self._cookie_thread = None
         if not self._closing:
-            self.cookies_btn.configure(state="normal", text="🔑  获取登录 Cookies")
+            self.cookies_btn.configure(state="normal", text="获取登录Cookie")
         else:
             self._wait_for_shutdown()
 
@@ -583,39 +604,31 @@ class App(ctk.CTk):
             "xxtui_api_key": self.xxtui_key_var.get(),
         }
 
-    def _save_settings(self) -> None:
+    def _on_setting_changed(self, *_args) -> None:
+        """任一设置变化后防抖 500ms 再写盘，避免逐键触发。"""
+        if self._save_job is not None:
+            self.after_cancel(self._save_job)
+        self._save_job = self.after(500, self._live_save)
+
+    def _live_save(self) -> None:
+        """实时保存当前设置；失败只记节流日志，不弹窗打断输入。"""
+        self._save_job = None
         try:
             settings = self._collect_settings()
         except ValueError:
-            self._show_error(
-                "数值格式错误",
-                "提交等待时间、检查间隔、答题刷新间隔或多AI最大等待时间必须是数字。",
-            )
+            # 数字字段处于无效中间态（如清空输入中）：不保存也不打扰，
+            # 待输入完成后下一次变更会正常落盘。
             return
 
         errors = self.config.save(settings)
         if errors:
-            self._show_error("配置错误", "\n".join(errors))
+            now = time.monotonic()
+            if now - self._last_save_error_log > 10:
+                self._last_save_error_log = now
+                self._log("设置保存失败：" + "；".join(errors))
             return
 
-        self._log("设置已保存。")
         self.notification.api_key = self.config.get("xxtui_api_key", "")
-
-    def _show_error(self, title: str, message: str) -> None:
-        dialog = ctk.CTkToplevel(self)
-        dialog.title(title)
-        dialog.geometry("360x140")
-        dialog.transient(self)
-        dialog.grab_set()
-
-        ctk.CTkLabel(dialog, text=message, wraplength=300).pack(pady=(20, 10))
-        ctk.CTkButton(dialog, text="确定", command=dialog.destroy, width=80).pack(pady=(0, 10))
-
-        # 居中
-        dialog.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width() - 360) // 2
-        y = self.winfo_y() + (self.winfo_height() - 140) // 2
-        dialog.geometry(f"+{x}+{y}")
 
     # ==================== Bot 控制 ====================
 
@@ -716,6 +729,11 @@ class App(ctk.CTk):
         if self._closing:
             return
         self._closing = True
+        # 关窗前把防抖中尚未落盘的设置改动立即保存，避免丢失最后一次修改。
+        if self._save_job is not None:
+            self.after_cancel(self._save_job)
+            self._save_job = None
+            self._live_save()
         self._cookie_stop_event.set()
         if self._bot_thread and self._bot_thread.is_alive():
             self.is_running = False
