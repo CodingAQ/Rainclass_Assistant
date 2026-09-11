@@ -360,6 +360,30 @@ class ClassroomPageTests(unittest.TestCase):
         )
         self.assertFalse(make_bot()._is_classroom_page(as_page(page)))
 
+    def test_v2_web_entry_path_is_home_page(self):
+        # 启动导航落点 {url}/v2/web/（可能未被重定向到 /v2/web/index）应视为首页
+        bot = make_bot()
+        self.assertTrue(
+            bot._is_home_page(as_page(FakePage("https://changjiang.yuketang.cn/v2/web/")))
+        )
+        self.assertTrue(
+            bot._is_home_page(as_page(FakePage("https://changjiang.yuketang.cn/v2/web/index")))
+        )
+
+    def test_v2_web_redirect_pages_are_never_classrooms(self):
+        # 9/8 事故：根路径被重定向到考试页；/v2/web/* 一律不是实时课堂
+        bot = make_bot()
+        exam = FakePage(
+            "https://changjiang.yuketang.cn/v2/web/exam/26109214/2094938",
+            {'[class*="timeline__"]': [FakeItem()]},
+        )
+        self.assertFalse(bot._is_classroom_page(as_page(exam)))
+        entry = FakePage(
+            "https://changjiang.yuketang.cn/v2/web/",
+            {'[class*="timeline__"]': [FakeItem()]},
+        )
+        self.assertFalse(bot._is_classroom_page(as_page(entry)))
+
     def test_timeline_is_strong_classroom_evidence(self):
         page = FakePage(
             "https://changjiang.yuketang.cn/pro/abc",

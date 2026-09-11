@@ -89,6 +89,10 @@ class BrowserManager:
         self._debug_port = self._resolve_debug_port(debug_port)
         # 导航主页地址：按所配雨课堂服务器决定（见 YUKETANG_SERVERS）
         self.base_url = (base_url or YUKETANG_URL).rstrip("/")
+        # 启动/进课导航用 Web 应用首页；根路径会被上下文重定向到不可预测的页面
+        self.home_url = f"{self.base_url}/v2/web/"
+        # 获取 Cookies 用登录页（含 #tab-student 登录入口）
+        self.login_url = f"{self.base_url}/web/"
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
@@ -254,7 +258,7 @@ class BrowserManager:
             browser = pw.chromium.launch(headless=False)
             context = browser.new_context(viewport={"width": 1280, "height": 720})
             page = context.new_page()
-            page.goto(self.base_url)
+            page.goto(self.login_url)
 
             # 轮询登录标记，使应用关闭时可以取消等待。
             logger.info("等待用户完成登录（最长 120 秒）...")
@@ -318,7 +322,7 @@ class BrowserManager:
             self._page = self._context.new_page()
 
         try:
-            self.page.goto(self.base_url, timeout=30_000)
+            self.page.goto(self.home_url, timeout=30_000)
             self.page.wait_for_selector("body", timeout=20_000)
             logger.info("已成功导航到雨课堂。")
             return True

@@ -306,7 +306,7 @@ class Bot:
         ).netloc.lower()
 
     def _is_home_page(self, page: Page) -> bool:
-        """是否处于所配服务器的首页（根路径或 v2/web/index）。"""
+        """是否处于所配服务器的首页（根路径或 v2/web 应用入口）。"""
         try:
             parts = urlsplit(page.url.strip())
             host = parts.netloc.lower()
@@ -315,7 +315,7 @@ class Bot:
             return False
         if host != self._server_host():
             return False
-        return path in ("", "/v2/web/index")
+        return path in ("", "/v2/web", "/v2/web/index")
 
     def _wait_for_classroom_page(self, timeout: float) -> Optional[Page]:
         """等待课堂页，并持续处理 Playwright 的新页面事件。"""
@@ -447,13 +447,14 @@ class Bot:
         except Exception:
             return False
 
-        if "/v2/web/index" in url:
-            return False
-        # 所配服务器的根路径是首页，不是课堂
+        # /v2/web/* 是 Web 应用页面（首页/课程页/考试页等），永远不是实时课堂；
+        # 所配服务器的根路径同理
         try:
             parts = urlsplit(url)
         except Exception:
             parts = None
+        if parts is not None and parts.path.startswith("/v2/web"):
+            return False
         if (
             parts is not None
             and parts.netloc.lower() == self._server_host()
