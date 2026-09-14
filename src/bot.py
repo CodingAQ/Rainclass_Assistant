@@ -50,7 +50,7 @@ CLASS_ENDED_SELECTOR = '//div[@title="下课啦！" and contains(@class, "timeli
 COOKIE_VALID_DAYS = 14
 
 # 有效的选择题选项
-VALID_OPTIONS = ["A", "B", "C", "D", "E", "F"]
+VALID_OPTIONS = ["A", "B", "C", "D", "E", "F", "G"]
 
 
 class Bot:
@@ -1042,17 +1042,17 @@ class Bot:
 
     @staticmethod
     def _parse_options(text: str) -> list[str]:
-        """严格解析 A-F，拒绝解释文本中的英文单词和错误码。"""
+        """严格解析 A-G，拒绝解释文本中的英文单词和错误码。"""
         if not text:
             return []
         match = re.fullmatch(
             r"\s*(?:(?:答案(?:是|为)?|ANSWER)\s*[:：]?\s*)?"
-            r"([A-F](?:\s*[,，、/\s]\s*[A-F])*)\s*[。.]?\s*",
+            r"([A-G](?:\s*[,，、/\s]\s*[A-G])*)\s*[。.]?\s*",
             text.upper(),
         )
         if not match:
             return []
-        letters = re.findall(r"[A-F]", match.group(1))
+        letters = re.findall(r"[A-G]", match.group(1))
         seen: set[str] = set()
         result: list[str] = []
         for letter in letters:

@@ -469,16 +469,16 @@ class AIService:
         else:
             text = str(value or "")
         compact = text.strip().upper()
-        if allow_compact and re.fullmatch(r"[A-F]{1,6}", compact):
+        if allow_compact and re.fullmatch(r"[A-G]{1,7}", compact):
             return tuple(sorted(set(compact)))
         match = re.fullmatch(
             r"\s*(?:(?:答案(?:是|为)?|ANSWER)\s*[:：]?\s*)?"
-            r"([A-F](?:\s*[,，、/\s]\s*[A-F])*)\s*[。.]?\s*",
+            r"([A-G](?:\s*[,，、/\s]\s*[A-G])*)\s*[。.]?\s*",
             text.upper(),
         )
         if not match:
             return ()
-        return tuple(sorted(set(re.findall(r"[A-F]", match.group(1)))))
+        return tuple(sorted(set(re.findall(r"[A-G]", match.group(1)))))
 
     @staticmethod
     def _extract_answer_json(value: str) -> Optional[dict]:
