@@ -368,6 +368,136 @@ model = second-model
 
         self.assertIn("调用失败", result)
 
+    def test_manual_truncate_ends_wait_and_votes_with_received_answers(self):
+        service = self.make_multi_service()
+        endpoints = [self.endpoint("fast"), self.endpoint("slow")]
+        release_slow = threading.Event()
+
+        def answer(endpoint, image_b64, prompt, timeout, mime_type):
+            if endpoint.name == "slow":
+                release_slow.wait(5)
+                return '{"type":"single","answers":"B"}'
+            return '{"type":"single","answers":"A"}'
+
+        holder = {}
+
+        def run():
+            holder["value"] = service._ask_multi("aW1hZ2U=", "prompt")
+
+        started = time.monotonic()
+        with (
+            patch.object(service, "_load_multi_ai_endpoints", return_value=endpoints),
+            patch.object(service, "_multi_ai_timeout", return_value=30.0),
+            patch.object(service, "_ask_multi_endpoint", side_effect=answer),
+        ):
+            thread = threading.Thread(target=run)
+            thread.start()
+            wait_until(lambda: service.multi_progress()["valid"] >= 1)
+            self.assertEqual(service.multi_progress()["valid"], 1)
+            service.request_truncate()
+            thread.join(3)
+            elapsed = time.monotonic() - started
+        release_slow.set()
+
+        self.assertFalse(thread.is_alive())
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(json.loads(holder["value"])["answers"], "A")
+
+    def test_truncate_before_request_does_not_cut_the_next_one(self):
+        service = self.make_multi_service()
+        endpoints = [self.endpoint("only")]
+        service.request_truncate()
+
+        with (
+            patch.object(service, "_load_multi_ai_endpoints", return_value=endpoints),
+            patch.object(
+                service,
+                "_ask_multi_endpoint",
+                return_value='{"type":"single","answers":"A"}',
+            ),
+        ):
+            _, accepted, pending, truncated = service._run_multi_requests(
+                "aW1hZ2U=", "prompt"
+            )
+
+        self.assertFalse(truncated)
+        self.assertEqual(pending, 0)
+        self.assertEqual(len(accepted), 1)
+
+    def test_truncate_without_answers_reports_truncated_failure(self):
+        service = self.make_multi_service()
+        endpoints = [self.endpoint("stuck")]
+        release = threading.Event()
+
+        def answer(*_args, **_kwargs):
+            release.wait(5)
+            return '{"type":"single","answers":"A"}'
+
+        holder = {}
+
+        def run():
+            holder["value"] = service._ask_multi("aW1hZ2U=", "prompt")
+
+        with (
+            patch.object(service, "_load_multi_ai_endpoints", return_value=endpoints),
+            patch.object(service, "_multi_ai_timeout", return_value=30.0),
+            patch.object(service, "_ask_multi_endpoint", side_effect=answer),
+        ):
+            thread = threading.Thread(target=run)
+            thread.start()
+            wait_until(lambda: service.multi_progress()["active"])
+            service.request_truncate()
+            thread.join(3)
+        release.set()
+
+        self.assertFalse(thread.is_alive())
+        self.assertIn("调用失败", holder["value"])
+        self.assertIn("截断", holder["value"])
+
+    def test_progress_snapshot_tracks_run_lifecycle(self):
+        service = self.make_multi_service()
+        self.assertFalse(service.multi_progress()["active"])
+        self.assertEqual(service.multi_progress()["total"], 0)
+
+        endpoints = [self.endpoint("a"), self.endpoint("b")]
+        with (
+            patch.object(service, "_load_multi_ai_endpoints", return_value=endpoints),
+            patch.object(service, "_ask_multi_endpoint", return_value="A"),
+        ):
+            service._run_multi_requests("aW1hZ2U=", "prompt")
+
+        snapshot = service.multi_progress()
+        self.assertFalse(snapshot["active"])
+        self.assertEqual(snapshot["total"], 2)
+        self.assertEqual(snapshot["received"], 2)
+        self.assertEqual(snapshot["valid"], 2)
+        self.assertFalse(snapshot["truncated"])
+
+    def test_stale_worker_cannot_overwrite_progress_of_a_new_run(self):
+        service = self.make_multi_service()
+        endpoints = [self.endpoint("only")]
+        with (
+            patch.object(service, "_load_multi_ai_endpoints", return_value=endpoints),
+            patch.object(service, "_ask_multi_endpoint", return_value="A"),
+        ):
+            service._run_multi_requests("aW1hZ2U=", "prompt")
+
+        current = service.multi_progress()
+        service._update_multi_progress(current["run_id"] - 1, 99, 99)
+
+        after = service.multi_progress()
+        self.assertEqual(after["received"], current["received"])
+        self.assertEqual(after["valid"], current["valid"])
+
+
+def wait_until(predicate, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
 
 class CompactErrorTests(unittest.TestCase):
     def test_html_error_is_classified_not_dumped(self):

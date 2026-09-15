@@ -93,6 +93,22 @@ class AIService:
         self._last_cleanup = 0.0
         self._closed = False
 
+        # 手动截断与进度：GUI 线程只递增序号，请求侧在入口快照基线后自行比对。
+        # 用递增序号而不是 Event，是为了避免两题之间空窗期的一次点击残留下来，
+        # 把下一题瞬间截断（Event 需要清理，清理就有竞态）。
+        self._multi_lock = threading.Lock()
+        self._truncate_seq = 0
+        self._multi_run_id = 0
+        self._multi_status: dict = {
+            "active": False,
+            "run_id": 0,
+            "total": 0,
+            "received": 0,
+            "valid": 0,
+            "started": 0.0,
+            "truncated": False,
+        }
+
     # ==================== 公开方法 ====================
 
     def get_answer(self, image_url: str, cookies: Optional[dict] = None) -> str:
@@ -211,6 +227,67 @@ class AIService:
         self._closed = True
         self._request_executor.shutdown(wait=False, cancel_futures=True)
         logger.debug("AI 服务线程池已关闭。")
+
+    # ==================== 手动截断 / 进度 ====================
+
+    def request_truncate(self) -> None:
+        """请求提前结束当前多AI等待：不再等剩余模型，用已返回的答案投票。
+
+        线程安全，可由 GUI 线程直接调用。只递增序号，不做别的判断；
+        正在等待的请求会自行发现序号变化并立即收尾。若此刻没有请求在收集，
+        这次点击不会残留成下一题的误截断（请求在入口快照基线，只认基线之后的递增）。
+        """
+        with self._multi_lock:
+            self._truncate_seq += 1
+
+    def multi_progress(self) -> dict:
+        """返回多AI作答的只读进度快照，供 GUI 轮询显示与判断能否截断。"""
+        with self._multi_lock:
+            snapshot = dict(self._multi_status)
+        elapsed = 0.0
+        if snapshot["active"] and snapshot["started"]:
+            elapsed = max(0.0, time.monotonic() - snapshot["started"])
+        snapshot["elapsed"] = elapsed
+        return snapshot
+
+    def _begin_multi_run(self, total: int) -> tuple[int, int]:
+        """登记一轮多AI收集，返回 (本轮 id, 截断序号基线)。"""
+        with self._multi_lock:
+            self._multi_run_id += 1
+            self._multi_status = {
+                "active": True,
+                "run_id": self._multi_run_id,
+                "total": total,
+                "received": 0,
+                "valid": 0,
+                "started": time.monotonic(),
+                "truncated": False,
+            }
+            return self._multi_run_id, self._truncate_seq
+
+    def _update_multi_progress(self, run_id: int, received: int, valid: int) -> None:
+        """更新本轮计数。迟到的工人线程拿着旧 run_id，不会污染新一轮的显示。"""
+        with self._multi_lock:
+            if self._multi_status["run_id"] != run_id:
+                return
+            self._multi_status["received"] = received
+            self._multi_status["valid"] = valid
+
+    def _finish_multi_run(
+        self,
+        run_id: int,
+        received: int,
+        valid: int,
+        truncated: bool,
+    ) -> None:
+        """收尾本轮：置为不活跃，保留最终计数供 GUI 显示最后一帧。"""
+        with self._multi_lock:
+            if self._multi_status["run_id"] != run_id:
+                return
+            self._multi_status["active"] = False
+            self._multi_status["received"] = received
+            self._multi_status["valid"] = valid
+            self._multi_status["truncated"] = truncated
 
     def submit_answer(
         self,
@@ -346,11 +423,11 @@ class AIService:
         prompt: str,
         mime_type: str = "image/png",
         max_wait: Optional[float] = None,
-    ) -> tuple[list[_MultiAIEndpoint], list[tuple[str, str]], int]:
-        """同时请求全部模型，返回截止前结果及尚未完成的数量。"""
+    ) -> tuple[list[_MultiAIEndpoint], list[tuple[str, str]], int, bool]:
+        """同时请求全部模型，返回「截止前收到的结果」「未完成数量」及是否被手动截断。"""
         endpoints = self._load_multi_ai_endpoints()
         if not endpoints:
-            return [], [], 0
+            return [], [], 0, False
 
         configured_timeout = self._multi_ai_timeout()
         timeout = (
@@ -359,12 +436,14 @@ class AIService:
             else max(0.05, min(configured_timeout, max_wait))
         )
         deadline = time.monotonic() + timeout
+        run_id, baseline = self._begin_multi_run(len(endpoints))
         lock = threading.Lock()
         all_done = threading.Event()
         results: list[tuple[str, str]] = []
-        state = {"remaining": len(endpoints), "accepting": True}
+        state = {"remaining": len(endpoints), "accepting": True, "received": 0, "valid": 0}
 
         def worker(endpoint: _MultiAIEndpoint) -> None:
+            started = time.monotonic()
             try:
                 remaining = max(0.1, deadline - time.monotonic())
                 result = self._ask_multi_endpoint(
@@ -377,14 +456,42 @@ class AIService:
             except Exception as exc:
                 logger.warning("多AI模型 [%s] 请求失败：%s", endpoint.name, exc)
             else:
+                text = result.strip()
+                accepted = False
+                vote: Optional[tuple[str, ...]] = None
                 with lock:
                     if state["accepting"] and time.monotonic() <= deadline:
-                        results.append((endpoint.name, result.strip()))
+                        results.append((endpoint.name, text))
+                        state["received"] += 1
+                        vote = self._canonical_vote(text)
+                        if vote is not None:
+                            state["valid"] += 1
+                        accepted = True
+                    received, valid = state["received"], state["valid"]
+                # 到达即上屏：用户要看着「已有几个答案」才知道何时值得手动截断，
+                # 不能等全部收完再一次性打印。
+                if accepted:
+                    cost = time.monotonic() - started
+                    if vote is None:
+                        logger.info(
+                            "多AI模型 [%s] 已返回（%.1fs），但内容无法解析为有效答案。",
+                            endpoint.name,
+                            cost,
+                        )
+                    else:
+                        logger.info(
+                            "多AI模型 [%s] 已返回（%.1fs）：%s",
+                            endpoint.name,
+                            cost,
+                            self._vote_to_answer(vote),
+                        )
+                self._update_multi_progress(run_id, received, valid)
             finally:
                 with lock:
                     state["remaining"] -= 1
-                    if state["remaining"] == 0:
-                        all_done.set()
+                    done = state["remaining"] == 0
+                if done:
+                    all_done.set()
 
         logger.info(
             "多AI作答：同时请求 %d 个模型，最大等待 %.1f 秒。",
@@ -399,14 +506,33 @@ class AIService:
                 daemon=True,
             ).start()
 
-        all_done.wait(max(0.0, deadline - time.monotonic()))
+        # 等待期间每 50ms 瞄一眼是否被手动截断；截断即收尾，用已收到的答案投票。
+        truncated = False
+        while True:
+            remaining_wait = deadline - time.monotonic()
+            if remaining_wait <= 0 or all_done.wait(min(0.05, remaining_wait)):
+                break
+            with self._multi_lock:
+                if self._truncate_seq > baseline:
+                    truncated = True
+                    break
+
         with lock:
             state["accepting"] = False
             accepted = list(results)
             pending = state["remaining"]
-        if pending:
+            final_received = state["received"]
+            final_valid = state["valid"]
+        if truncated:
+            logger.warning(
+                "已手动截断：不再等待剩余 %d 个模型，改用已返回的 %d 个有效答案投票。",
+                pending,
+                final_valid,
+            )
+        elif pending:
             logger.warning("多AI等待时间已到，忽略 %d 个迟到模型。", pending)
-        return endpoints, accepted, pending
+        self._finish_multi_run(run_id, final_received, final_valid, truncated)
+        return endpoints, accepted, pending, truncated
 
     def _ask_multi_endpoint(
         self,
@@ -564,7 +690,7 @@ class AIService:
         mime_type: str = "image/png",
         max_wait: Optional[float] = None,
     ) -> str:
-        endpoints, raw_results, _ = self._run_multi_requests(
+        endpoints, raw_results, _, truncated = self._run_multi_requests(
             image_b64,
             prompt,
             mime_type,
@@ -573,16 +699,17 @@ class AIService:
         if not endpoints:
             return "多AI调用失败：配置文件中没有可用模型。"
 
+        # 每个模型的到达情况已在收集阶段实时上屏，这里只负责计票，不再重复打印。
         votes: list[tuple[str, ...]] = []
         for name, result in raw_results:
             vote = self._canonical_vote(result)
             if vote is None:
-                logger.warning("多AI模型 [%s] 返回无效或错误结果，已剔除。", name)
                 continue
             votes.append(vote)
-            logger.info("多AI模型 [%s] 有效返回：%s", name, self._vote_to_answer(vote))
 
         if not votes:
+            if truncated:
+                return "多AI调用失败：已手动截断，但暂无有效答案。"
             return "多AI调用失败：截止时间内没有有效答案。"
 
         counts = Counter(votes)
@@ -637,7 +764,7 @@ class AIService:
         )
 
     def _test_multi_vision(self, image_b64: str, mime_type: str = "image/png") -> str:
-        endpoints, raw_results, _ = self._run_multi_requests(
+        endpoints, raw_results, _, _ = self._run_multi_requests(
             image_b64,
             TEST_PROMPT,
             mime_type,

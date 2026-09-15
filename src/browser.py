@@ -1,7 +1,6 @@
 """浏览器管理模块 - 基于 Playwright 封装。
 
-替代原来的 Selenium/ChromeDriver 方案。Playwright 自带 Chromium，
-首次运行 `playwright install chromium` 后即可使用，无需系统安装 Chrome 或匹配驱动。
+首次启动需运行 `playwright install chromium`
 """
 
 import logging
@@ -18,8 +17,7 @@ logger = logging.getLogger(__name__)
 # 默认会话状态文件（存储 cookies + localStorage）
 DEFAULT_STATE_FILE = "browser_state.json"
 
-# 雨课堂各服务器主页。域名以官方帮助页为准（荷塘雨课堂 = pro.yuketang.cn）：
-# https://www.yuketang.cn/help?detail=508
+# 雨课堂各服务器主页
 YUKETANG_SERVERS: dict[str, str] = {
     "雨课堂": "https://www.yuketang.cn",
     "荷塘雨课堂": "https://pro.yuketang.cn",

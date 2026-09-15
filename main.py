@@ -90,7 +90,7 @@ def _setup_logging() -> None:
 
     gh = _GuiLogHandler()
     gh.setFormatter(LOG_FORMAT)
-    gh.addFilter(_MaxLogLengthFilter(500))
+    gh.addFilter(_MaxLogLengthFilter(100))
 
     _log_listener = QueueListener(_log_queue, fh, gh)
     _log_listener.start()
@@ -128,6 +128,8 @@ class App(ctk.CTk):
         self.config = Config()
         self.browser: BrowserManager | None = None
         self.notification = NotificationService(self.config.get("xxtui_api_key", ""))
+        # bot 运行期间指向当前 AI 服务，供「截断作答」按钮查询进度并触发截断
+        self.ai_service: AIService | None = None
 
         # ---- 状态 ----
         self.is_running = False
@@ -145,6 +147,7 @@ class App(ctk.CTk):
         # ---- 构建 UI ----
         self._setup_ui()
         self._start_log_pump()
+        self.after(300, self._refresh_truncate_btn)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._log("应用已启动。")
@@ -251,6 +254,22 @@ class App(ctk.CTk):
             command=self._toggle_bot,
         )
         self.toggle_btn.pack(side="left", pady=8)
+
+        # 截断作答：多AI作答中不再等待剩余模型，用已返回的答案投票。
+        # 未作答/暂无答案时禁用占位，仅在真的收到有效答案后可点。
+        self.truncate_btn = ctk.CTkButton(
+            status_bar,
+            text="等待题目中……",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            height=36,
+            corner_radius=8,
+            fg_color="#555555",
+            hover_color="#444444",
+            text_color_disabled="#BDBDBD",
+            state="disabled",
+            command=self._run_truncate,
+        )
+        self.truncate_btn.pack(side="left", padx=(10, 0), pady=8)
 
         self.cookies_btn = ctk.CTkButton(
             status_bar,
@@ -658,6 +677,63 @@ class App(ctk.CTk):
 
         self.notification.api_key = self.config.get("xxtui_api_key", "")
 
+    # ==================== 截断作答 ====================
+
+    def _run_truncate(self) -> None:
+        """手动截断：不再等待剩余模型，用当前已返回的答案投票。
+
+        真正的动作只是给 AI 服务递增一个序号，等待中的收集循环自己会发现并收尾；
+        bot 侧每秒轮询 Future，完成后照常走点击与提交，无需额外通知。
+        """
+        service = self.ai_service
+        if service is None:
+            return
+        progress = service.multi_progress()
+        if not progress.get("active"):
+            return
+
+        valid = int(progress.get("valid", 0))
+        pending = max(0, int(progress.get("total", 0)) - int(progress.get("received", 0)))
+        service.request_truncate()
+        self.truncate_btn.configure(state="disabled", text="正在截断……")
+        self._log(
+            f"已请求截断：用当前 {valid} 个有效答案投票，不再等待剩余 {pending} 个模型。"
+        )
+
+    def _refresh_truncate_btn(self) -> None:
+        """定时刷新截断按钮的可用状态与文案。"""
+        try:
+            self._update_truncate_btn()
+            self.after(300, self._refresh_truncate_btn)
+        except (RuntimeError, tk.TclError):
+            return
+
+    def _update_truncate_btn(self) -> None:
+        service = self.ai_service
+        progress = service.multi_progress() if service is not None else {}
+
+        # 未在收集（含未运行、题目已作答完）：禁用占位
+        if not progress.get("active"):
+            self.truncate_btn.configure(
+                state="disabled", text="等待题目中……", fg_color="#555555"
+            )
+            return
+
+        # 正在作答但还没有可用答案：暂时无可截断的内容
+        valid = int(progress.get("valid", 0))
+        if valid <= 0:
+            self.truncate_btn.configure(
+                state="disabled", text="作答中（暂无答案）", fg_color="#555555"
+            )
+            return
+
+        self.truncate_btn.configure(
+            state="normal",
+            text=f"截断（已有 {valid} 个答案）",
+            fg_color="#E53935",
+            hover_color="#C62828",
+        )
+
     # ==================== Bot 控制 ====================
 
     def _toggle_bot(self) -> None:
@@ -680,6 +756,7 @@ class App(ctk.CTk):
         )
         self.stop_event = threading.Event()
         ai_service = AIService(self.config)
+        self.ai_service = ai_service
 
         self.is_running = True
         self._stopping = False
@@ -729,6 +806,7 @@ class App(ctk.CTk):
         self._bot_thread = None
         self.browser = None
         self.stop_event = None
+        self.ai_service = None
         self.is_running = False
         self._stopping = False
         self._set_running_ui(False)
