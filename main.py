@@ -37,7 +37,7 @@ LOG_FORMAT = logging.Formatter(
 
 LOG_DIR = Path("log")
 LOG_FILE = LOG_DIR / "bot.log"
-# 按本地时间每天零点轮转，保留最近 365 天
+# 日志保留最近 365 天
 LOG_BACKUP_DAYS = 365
 
 # 队列
@@ -792,12 +792,23 @@ class App(ctk.CTk):
         self._set_running_ui(True)
         self._log("开始检查课程...")
 
+        # 调试入口（main-debug.py --no-answer）通过环境变量关闭自动答题。
+        auto_answer = os.environ.get("RAINCLASS_NO_ANSWER", "").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if not auto_answer:
+            self._log("⚠ 调试模式：本次不会自动答题，仅进课堂与签到。")
+
         bot = Bot(
             config=self.config,
             browser=self.browser,
             ai_service=ai_service,
             notification=self.notification,
             stop_event=self.stop_event,
+            auto_answer=auto_answer,
         )
 
         thread: threading.Thread

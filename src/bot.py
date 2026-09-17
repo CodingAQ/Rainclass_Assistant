@@ -60,12 +60,16 @@ class Bot:
         ai_service: "AIService",    # type: ignore
         notification: "NotificationService",  # type: ignore
         stop_event: threading.Event,
+        auto_answer: bool = True,
     ):
         self.config = config
         self.browser = browser
         self.ai = ai_service
         self.notification = notification
         self.stop_event = stop_event
+        # 调试开关：关闭后只进课堂、签到，不发 AI 请求也不点击提交。
+        self.auto_answer = auto_answer
+        self._skip_answer_logged = False
         self._question_states: dict[str, tuple[str, float, int]] = {}
         self._last_notify_time = 0.0
         self._signed_in = False
@@ -682,7 +686,11 @@ class Bot:
                         self.log(f"进入新的 PPT 页：{cur[:100]}")
 
                 self._check_and_sign_in(page)
-                self._answer(page)
+                if self.auto_answer:
+                    self._answer(page)
+                elif not self._skip_answer_logged:
+                    self._skip_answer_logged = True
+                    self.log("调试模式：已禁用自动答题，课堂页面保持原样（不再重复提示）。")
             except Exception as e:
                 self.log(f"课堂页面处理失败：{e}，稍后重试。")
                 if self.stop_event.wait(min(quiz_interval, RETRY_DELAY)):

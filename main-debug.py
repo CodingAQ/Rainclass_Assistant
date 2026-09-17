@@ -12,11 +12,18 @@ def main() -> None:
         action="store_true",
         help="open the GUI without starting the bot",
     )
+    parser.add_argument(
+        "--no-answer",
+        action="store_true",
+        help="run the bot without answering: enter class and sign in only",
+    )
     args = parser.parse_args()
 
     # BrowserManager reads these values when the bot creates it.
     os.environ["RAINCLASS_DEBUG"] = "1"
     os.environ["RAINCLASS_DEBUG_PORT"] = str(args.port)
+    if args.no_answer:
+        os.environ["RAINCLASS_NO_ANSWER"] = "1"
 
     from main import run_app
 
