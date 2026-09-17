@@ -5,7 +5,12 @@ import threading
 import time
 import tkinter as tk
 from datetime import datetime
-from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
+from logging.handlers import (
+    QueueHandler,
+    QueueListener,
+    TimedRotatingFileHandler,
+)
+from pathlib import Path
 from tkinter import messagebox
 
 import customtkinter as ctk
@@ -29,6 +34,11 @@ APP_MIN_H = 500
 LOG_FORMAT = logging.Formatter(
     "%(asctime)s  %(message)s", datefmt="%H:%M:%S"
 )
+
+LOG_DIR = Path("log")
+LOG_FILE = LOG_DIR / "bot.log"
+# 按本地时间每天零点轮转，保留最近 365 天
+LOG_BACKUP_DAYS = 365
 
 # 队列
 _log_queue: queue.Queue = queue.Queue()
@@ -66,6 +76,18 @@ class _MaxLogLengthFilter(logging.Filter):
         return True
 
 
+def _bot_log_namer(default_name: str) -> str:
+    """把 TimedRotating 默认名 bot.log.YYYY-MM-DD 改成 bot_YYYY-MM-DD.log。"""
+    path = Path(default_name)
+    name = path.name
+    if not name.startswith("bot.log."):
+        return default_name
+    date_part = name[len("bot.log.") :]
+    if len(date_part) == 10 and date_part[4] == "-" and date_part[7] == "-":
+        return str(path.with_name(f"bot_{date_part}.log"))
+    return default_name
+
+
 def _setup_logging() -> None:
     global _log_listener
     if _log_listener is not None:
@@ -84,13 +106,20 @@ def _setup_logging() -> None:
     root_logger.addHandler(qh)
 
     length_gate = _MaxLogLengthFilter()
-    fh = RotatingFileHandler("bot.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    fh = TimedRotatingFileHandler(
+        LOG_FILE,
+        when="midnight",
+        backupCount=LOG_BACKUP_DAYS,
+        encoding="utf-8",
+    )
+    fh.namer = _bot_log_namer
     fh.setFormatter(LOG_FORMAT)
     fh.addFilter(length_gate)
 
     gh = _GuiLogHandler()
     gh.setFormatter(LOG_FORMAT)
-    gh.addFilter(_MaxLogLengthFilter(100))
+    gh.addFilter(_MaxLogLengthFilter(120))
 
     _log_listener = QueueListener(_log_queue, fh, gh)
     _log_listener.start()

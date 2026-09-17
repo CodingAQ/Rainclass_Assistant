@@ -25,19 +25,13 @@ from openai.types.chat import ChatCompletionMessageParam
 
 logger = logging.getLogger(__name__)
 
-# 模型报错可能携带整页 HTML（如 Cloudflare 挑战页）或巨型 payload，
-# 全量写进日志会刷爆 GUI 控制窗格和日志文件，因此统一压缩。
+# 压缩模型报错
 _ERROR_LOG_LIMIT = 120
 _HTML_MARKERS = ("<html", "<!doctype", "<script", "just a moment", "challenge")
 
 
 def _compact_error(value: object, limit: int = _ERROR_LOG_LIMIT) -> str:
-    """把异常/错误文本压成适合日志的一行短消息。
-
-    - 压平空白字符
-    - 内容像 HTML 页面时直接归类为"疑似被网关拦截"，不保留正文
-    - 超过 limit 字符时截断并标注原始长度
-    """
+    """把异常/错误文本压成适合日志的一行短消息，在截断时标注原始长度"""
     text = str(value).strip()
     compact = re.sub(r"\s+", " ", text)
     lowered = compact.lower()
@@ -47,7 +41,7 @@ def _compact_error(value: object, limit: int = _ERROR_LOG_LIMIT) -> str:
         return f"{compact[:limit]}...(已截断，原始 {len(text)} 字符)"
     return compact
 
-# 提示词模板：统一 JSON 返回，不再区分客观/主观两套提示词
+# 提示词，模型统一返回 JSON 
 PROMPT_ANSWER = (
     "请分析这张图片中的习题，并返回题目类型和正确的答案选项json，格式为："
     '{"type":"题目类型","answers":"正确的答案选项"} 。'
@@ -62,10 +56,11 @@ PROMPT_ANSWER = (
     "回答仅包含json，禁止使用代码块包裹，禁止使用反引号，回复不要包含任何额外信息。"
 )
 
+# 测试模型视觉
 TEST_PROMPT = "用十六个字以内描述该图片"
-
-# 测试图片路径
 TEST_IMAGE_PATH = "test_pic.png"
+
+
 NO_THINKING_EXTRA_BODY = {"enable_thinking": False}
 
 
@@ -81,8 +76,6 @@ class _MultiAIEndpoint:
 class AIService:
     """AI 答题服务，支持单模型及 INI 配置的多模型并行投票。"""
 
-    # 答题请求只允许应用层发起一次。OpenAI SDK 默认会对 429/5xx 等错误
-    # 自动重试，视觉请求成本较高，且会让一次题目请求被放大成多次调用。
     ANSWER_MAX_TOKENS = 128
 
     def __init__(self, config: "Config"):  # type: ignore
@@ -113,7 +106,7 @@ class AIService:
 
     def get_answer(self, image_url: str, cookies: Optional[dict] = None) -> str:
         """
-        根据配置的模型调用 AI 并返回答案（统一 JSON 提示词，见 PROMPT_ANSWER）。
+        根据配置的模型调用 AI 并返回答案。
 
         cookies：可选，带鉴权下载题目图片（雨课堂题图可能需要登录态）。
         图片一律先下载再以 base64 传输，避免 URL 直传失败后产生第二次调用。

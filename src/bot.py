@@ -31,13 +31,10 @@ RETRY_DELAY = 10
 # 60 秒：等待期间不产生新调用；超时后关闭本轮新开的标签页。
 CLASSROOM_OPEN_TIMEOUT = 60
 
-# 首页 DOM 刷新间隔（秒）。首页在上课期间加载后不会自动更新，已结束
-# 课程的任务条会一直留在已渲染的 DOM 里，导致主循环反复点击已结束的
-# 课程并每次泄漏一个标签页，因此必须定期强制刷新让它反映服务器真相。
+# 首页 DOM 刷新间隔（秒）
 HOME_REFRESH_INTERVAL = 600
 
-# 进入课程的标签页数上限（保险丝）。正常课堂只有 2-3 个标签页
-# （习题是同页导航），达到上限说明出现异常堆积：暂停进入并告警。
+# 课程标签页数上限
 MAX_ENTRY_TABS = 5
 
 # 标签页超限警告的节流间隔（秒）。
@@ -46,7 +43,7 @@ TAB_LIMIT_WARN_INTERVAL = 300
 # 雨课堂下课后会把该消息永久保留在课堂时间线中。
 CLASS_ENDED_SELECTOR = '//div[@title="下课啦！" and contains(@class, "timeline__msg")]'
 
-# Cookie 有效期（天）—— 与 main.py 中的显示共用，抽成单一常量避免两处硬编码
+# Cookie 有效期（估算）
 COOKIE_VALID_DAYS = 14
 
 # 有效的选择题选项
@@ -77,7 +74,7 @@ class Bot:
         self._answer_future: Optional[Future[str]] = None
         self._answer_question_id = ""
         self._answer_exercise_path = ""
-        self._last_unidentified_log = 0.0  # 「无法识别题目」日志节流
+        self._last_unidentified_log = 0.0
         self._exercise_html_saved = False
         self._ended_lesson_ids: set[str] = set()
         self._waiting_for_class_logged = False
@@ -88,7 +85,8 @@ class Bot:
         """统一日志输出（只 emit 一次）。
 
         直接走 logging 根 logger 的 QueueHandler：
-        QueueListener 会把同一条记录同时派发给文件处理器(RotatingFileHandler)
+        QueueListener 会把同一条记录同时派发给文件处理器(TimedRotatingFileHandler，
+        写入 log/bot.log，每天零点轮转为 log/bot_YYYY-MM-DD.log)
         与 GUI 处理器(_GuiLogHandler)，因此文件与界面都会各收到一次。
         切勿再二次 emit（例如同时走其他打印通道），否则同一条日志会打印两遍。
         """
