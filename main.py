@@ -422,6 +422,12 @@ class App(ctk.CTk):
         self.quiz_refresh_interval_var, _ = self._entry_row(
             scroll, "答题刷新间隔（秒）", str(self.config.get("quiz_refresh_interval", 1))
         )
+        self.auto_truncate_seconds_var, _ = self._entry_row(
+            scroll,
+            "答题自动截断时间",
+            str(self.config.get("auto_truncate_seconds", 0)),
+            hint="单位：秒；设为 0 则不启用",
+        )
 
         # ---- 通知 ----
         self._section_label(scroll, "🔔 微信通知")
@@ -447,6 +453,7 @@ class App(ctk.CTk):
             self.submit_delay_var,
             self.check_interval_var,
             self.quiz_refresh_interval_var,
+            self.auto_truncate_seconds_var,
             self.xxtui_key_var,
         ):
             var.trace_add("write", self._on_setting_changed)
@@ -459,15 +466,35 @@ class App(ctk.CTk):
         )
         lbl.pack(anchor="w", pady=(14, 2))
 
-    def _entry_row(self, parent: ctk.CTkFrame, label: str, default: str, show: str = "") -> tuple[tk.StringVar, ctk.CTkFrame]:
+    def _entry_row(
+        self,
+        parent: ctk.CTkFrame,
+        label: str,
+        default: str,
+        show: str = "",
+        hint: str = "",
+    ) -> tuple[tk.StringVar, ctk.CTkFrame]:
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", pady=3)
-        ctk.CTkLabel(row, text=label, width=130, anchor="w").pack(side="left", padx=(0, 8))
+
+        line = ctk.CTkFrame(row, fg_color="transparent")
+        line.pack(fill="x")
+        ctk.CTkLabel(line, text=label, width=130, anchor="w").pack(side="left", padx=(0, 8))
         var = tk.StringVar(value=default)
-        entry = ctk.CTkEntry(row, textvariable=var)
+        entry = ctk.CTkEntry(line, textvariable=var)
         if show:
             entry.configure(show=show)
         entry.pack(side="left", fill="x", expand=True)
+
+        # 可选说明：与输入框左对齐，跟在下方
+        if hint:
+            ctk.CTkLabel(
+                row,
+                text=hint,
+                anchor="w",
+                font=ctk.CTkFont(size=11),
+                text_color="gray",
+            ).pack(fill="x", padx=(138, 0))
         return var, row
 
     def _checkbox_row(self, parent: ctk.CTkFrame, label: str, default: bool) -> tk.BooleanVar:
@@ -666,6 +693,7 @@ class App(ctk.CTk):
             "submit_delay": int(self.submit_delay_var.get()),
             "check_interval": int(self.check_interval_var.get()),
             "quiz_refresh_interval": int(self.quiz_refresh_interval_var.get()),
+            "auto_truncate_seconds": int(self.auto_truncate_seconds_var.get()),
             "xxtui_api_key": self.xxtui_key_var.get(),
         }
 

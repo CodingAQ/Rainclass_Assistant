@@ -49,6 +49,20 @@ COOKIE_VALID_DAYS = 14
 # 有效的选择题选项
 VALID_OPTIONS = ["A", "B", "C", "D", "E", "F", "G"]
 
+# 答题倒计时
+#   <div class="time-box"><div class="timing timing--number">倒计时 14:36</div></div>
+COUNTDOWN_SELECTOR = ".slide__cmp .time-box .timing"
+# 分、秒均补零到两位；服务端推送到达前文本是「倒计时 --:--」。
+COUNTDOWN_PATTERN = re.compile(r"倒计时\s*(\d{1,3}):([0-5]\d)")
+# 倒计时不再显示数字时的已知文案：(文案, 日志说明)
+COUNTDOWN_STATE_WORDS = (
+    ("已完成", "题目已提交"),
+    ("作答已结束", "作答时间已耗尽"),
+    ("题目不限时", "该题不限时"),
+    ("题目续时", "该题刚被续时"),
+    ("老师可能会随时结束答题", "该题不限时，老师可随时收题"),
+)
+
 
 class Bot:
     """课堂自动化 Bot。在独立线程中运行主循环。"""
@@ -79,6 +93,9 @@ class Bot:
         self._answer_question_id = ""
         self._answer_exercise_path = ""
         self._last_unidentified_log = 0.0
+        # 自动截断：记录已触发过的题目，避免同一题重复请求；等待首个答案时按间隔提示。
+        self._auto_truncated_question_id = ""
+        self._last_auto_truncate_wait_log = 0.0
         self._exercise_html_saved = False
         self._ended_lesson_ids: set[str] = set()
         self._waiting_for_class_logged = False
@@ -787,6 +804,9 @@ class Bot:
         if self._answer_future is not None:
             if self._answer_future.done():
                 self._complete_pending_answer(page)
+                return
+            # 等待期间按剩余答题时间判断是否需要提前收尾（复用手动截断机制）。
+            self._maybe_auto_truncate(page)
             return
 
         # 当前点击逻辑只支持 data-option 客观题；没有可操作选项时不调用 AI。
@@ -875,6 +895,60 @@ class Bot:
         # 测试桩或缓存结果可能立即完成。
         if future.done():
             self._complete_pending_answer(page)
+
+    def _maybe_auto_truncate(self, page: Page) -> None:
+        """按剩余答题时间自动截断多AI等待（复用与手动截断相同的机制）。
+
+        当题目倒计时剩余秒数已不足 auto_truncate_seconds 时，提前结束等待、
+        用已返回的答案投票；若此刻还没有任何有效答案，则保持等待，直到出现
+        第一个有效答案再截断——否则会把空答案送进提交流程，等于白丢一题。
+
+        与「多AI最大等待」的关系：后者是防止模型调用悬空，本项是防止剩余时间
+        不够提交，两者各自独立判断、取先到者。由于本项的目的就是抢在收题前提交，
+        其触发优先于最大等待（request_truncate 会让等待循环立即收尾）。
+
+        判断顺序：先做纯内存检查（阈值、是否已截断、多AI是否仍在收集），
+        全部通过后才读页面倒计时，避免单AI或本轮已收尾时每个轮询都打 DOM。
+        """
+        threshold = self._int_setting("auto_truncate_seconds", 0, 0, 3600)
+        if threshold <= 0:
+            return
+        if (
+            self._answer_question_id
+            and self._auto_truncated_question_id == self._answer_question_id
+        ):
+            return  # 本题已经自动截断过，不重复请求
+
+        # 截断与进度查询都是 AIService 的公开接口：前者与「手动截断」按钮共用，
+        # 后者给出实时有效票数。非多AI作答或测试桩没有这些能力，直接跳过。
+        progress_fn = getattr(self.ai, "multi_progress", None)
+        truncate_fn = getattr(self.ai, "request_truncate", None)
+        if not callable(progress_fn) or not callable(truncate_fn):
+            return
+
+        # 先确认多AI收集仍在进行（内存快照），再读倒计时（DOM）。
+        progress = progress_fn()
+        if not progress.get("active"):
+            return  # 本轮收集已收尾，或当前不是多AI作答
+
+        remaining = self._read_remaining_seconds(page)
+        if remaining is None or remaining > threshold:
+            return
+
+        valid = int(progress.get("valid", 0) or 0)
+        if valid <= 0:
+            # 一个有效答案都还没有：继续等，交给后续轮询再判断（提示做节流）。
+            now = time.time()
+            if now - self._last_auto_truncate_wait_log > 30:
+                self._last_auto_truncate_wait_log = now
+                self.log(f"剩余 {remaining} 秒，但尚无有效答案，继续等待首个答案。")
+            return
+
+        truncate_fn()
+        self._auto_truncated_question_id = self._answer_question_id
+        self.log(
+            f"剩余 {remaining} 秒，已自动截断：用已返回的 {valid} 个有效答案投票。"
+        )
 
     def _complete_pending_answer(self, page: Page) -> None:
         future = self._answer_future
@@ -1169,6 +1243,48 @@ class Bot:
             return self._first_visible(options) is not None
         except Exception:
             return False
+
+    def _read_remaining_seconds(self, page: Page) -> Optional[int]:
+        """读取当前题目的倒计时剩余秒数；读不到有效值时返回 None。
+
+        返回 None 的情形：页面已关闭、当前页没有可见的倒计时元素（非习题页，
+        或 PPT 页里被隐藏的历史节点）、服务端尚未推送初始秒数（文本仍是
+        「倒计时 --:--」）、题目已提交、作答时间已耗尽、或该题不限时。
+
+        实现依据（2026-09-17 实测 + 前端源码核对）：
+        - 倒计时是幻灯片右上角唯一的 time-box，文本形如「倒计时 14:36」，
+          分与秒都补零到两位。归零后文本会被替换成文案而不再有数字，
+          所以结束态按文案识别，而不是去匹配「00:00」。
+        - 该值由前端收到服务端推送后自行每秒递减，服务端只在题目下发时推一次。
+          因此标签页被浏览器节流时它会偏大，不能当作精确计时依据。
+        - 页面可能保留历史 slide，故取最后一个可见节点。
+        """
+        try:
+            if page.is_closed():
+                return None
+            node = self._last_visible(page.locator(COUNTDOWN_SELECTOR))
+        except Exception as exc:
+            logger.debug("读取倒计时失败：%s", exc)
+            return None
+        if node is None:
+            return None
+
+        try:
+            text = (node.inner_text() or "").strip()
+        except Exception as exc:
+            logger.debug("读取倒计时文本失败：%s", exc)
+            return None
+
+        match = COUNTDOWN_PATTERN.search(text)
+        if match:
+            return int(match.group(1)) * 60 + int(match.group(2))
+
+        for word, reason in COUNTDOWN_STATE_WORDS:
+            if word in text:
+                logger.debug("倒计时当前不可用（%s）：%r", reason, text)
+                return None
+        logger.debug("倒计时文本无法识别：%r", text)
+        return None
 
     def _find_submit_button(self, page: Page):
         """返回可见提交按钮；按钮可能位于题目卡片外的页面操作栏。

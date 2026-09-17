@@ -7,7 +7,7 @@ from unittest.mock import mock_open, patch
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
-from src.bot import Bot, CLASS_ENDED_SELECTOR
+from src.bot import Bot, CLASS_ENDED_SELECTOR, COUNTDOWN_SELECTOR
 from src.browser import BrowserManager
 
 
@@ -193,11 +193,18 @@ class StoppingEvent(FakeStopEvent):
 
 
 class FakeAI:
-    def __init__(self, answer='{"type":"single","answers":"A"}', complete=True):
+    def __init__(
+        self,
+        answer='{"type":"single","answers":"A"}',
+        complete=True,
+        progress=None,
+    ):
         self.answer = answer
         self.complete = complete
         self.answer_calls = 0
         self.last_future = None
+        self.progress = progress if progress is not None else {"active": False}
+        self.truncate_requests = 0
 
     def submit_answer(self, **kwargs):
         self.answer_calls += 1
@@ -206,6 +213,12 @@ class FakeAI:
             future.set_result(self.answer)
         self.last_future = future
         return future
+
+    def multi_progress(self):
+        return dict(self.progress)
+
+    def request_truncate(self):
+        self.truncate_requests += 1
 
     def shutdown(self):
         return None
@@ -1104,6 +1117,188 @@ class AnswerActionTests(unittest.TestCase):
             parse('{"type":"unknown","answers":"A"}'),
             ("unknown", [], ""),
         )
+
+
+class CountdownTests(unittest.TestCase):
+    """幻灯片倒计时剩余秒数提取。"""
+
+    def _page(self, items):
+        return FakePage(
+            "https://changjiang.yuketang.cn/lesson/fullscreen/v3/123/exercise/1",
+            selectors={COUNTDOWN_SELECTOR: items},
+        )
+
+    def test_parses_countdown_text_into_seconds(self):
+        bot = make_bot()
+        read = bot._read_remaining_seconds
+        cases = {
+            "倒计时 14:36": 876,
+            "倒计时 00:07": 7,
+            "倒计时 09:00": 540,
+            "倒计时 00:00": 0,
+            "倒计时 100:00": 6000,
+            " 倒计时 5:03 ": 303,
+            "倒计时  12:34": 754,
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(read(as_page(self._page([FakeItem(text=text)]))), expected)
+
+    def test_placeholder_before_server_push_returns_none(self):
+        """服务端推送到达前文本是占位符，不能当成 0 秒。"""
+        bot = make_bot()
+        page = self._page([FakeItem(text="倒计时 --:--")])
+        self.assertIsNone(bot._read_remaining_seconds(as_page(page)))
+
+    def test_finished_and_unlimited_states_return_none(self):
+        bot = make_bot()
+        for text in ("已完成", "作答已结束", "题目不限时", "题目续时 5分钟",
+                     "老师可能会随时结束答题"):
+            with self.subTest(text=text):
+                page = self._page([FakeItem(text=text)])
+                self.assertIsNone(bot._read_remaining_seconds(as_page(page)))
+
+    def test_missing_or_hidden_node_returns_none(self):
+        bot = make_bot()
+        read = bot._read_remaining_seconds
+        self.assertIsNone(read(as_page(self._page([]))))
+        self.assertIsNone(read(as_page(self._page([FakeItem(text="倒计时 14:36", visible=False)]))))
+
+    def test_hidden_history_slide_is_ignored(self):
+        """页面保留历史 slide 时，取可见的那个而不是旧节点。"""
+        bot = make_bot()
+        page = self._page([
+            FakeItem(text="倒计时 14:36", visible=True),
+            FakeItem(text="已完成", visible=False),
+        ])
+        self.assertEqual(bot._read_remaining_seconds(as_page(page)), 876)
+
+    def test_latest_visible_countdown_wins(self):
+        bot = make_bot()
+        page = self._page([
+            FakeItem(text="倒计时 14:00", visible=True),
+            FakeItem(text="倒计时 13:00", visible=True),
+        ])
+        self.assertEqual(bot._read_remaining_seconds(as_page(page)), 780)
+
+    def test_closed_page_returns_none(self):
+        bot = make_bot()
+        page = FakePage(
+            "https://changjiang.yuketang.cn/lesson/fullscreen/v3/123/exercise/1",
+            selectors={COUNTDOWN_SELECTOR: [FakeItem(text="倒计时 14:36")]},
+            closed=True,
+        )
+        self.assertIsNone(bot._read_remaining_seconds(as_page(page)))
+
+    def test_unrecognized_text_returns_none(self):
+        bot = make_bot()
+        page = self._page([FakeItem(text="题目加载中")])
+        self.assertIsNone(bot._read_remaining_seconds(as_page(page)))
+
+
+class AutoTruncateTests(unittest.TestCase):
+    """按剩余倒计时自动截断（复用多AI手动截断机制）。"""
+
+    URL = "https://changjiang.yuketang.cn/lesson/fullscreen/v3/123/exercise/1"
+
+    def _bot(self, threshold, countdown_text, progress, question_id="q1"):
+        page = FakePage(
+            self.URL,
+            selectors={COUNTDOWN_SELECTOR: [FakeItem(text=countdown_text)]},
+        )
+        ai = FakeAI(complete=False, progress=progress)
+        bot = Bot(
+            FakeConfig({"auto_truncate_seconds": threshold}),
+            FakeBrowser([page]),
+            ai,
+            object(),
+            cast(Any, FakeStopEvent()),
+        )
+        bot._answer_future = Future()  # 未完成 → 模拟 AI 请求进行中
+        bot._answer_question_id = question_id
+        return bot, page, ai
+
+    def test_truncates_when_remaining_time_is_below_threshold(self):
+        bot, page, ai = self._bot(
+            60, "倒计时 00:45", {"active": True, "valid": 3, "received": 5, "total": 30}
+        )
+        bot._maybe_auto_truncate(as_page(page))
+        self.assertEqual(ai.truncate_requests, 1)
+
+    def test_does_not_truncate_when_time_is_still_enough(self):
+        bot, page, ai = self._bot(
+            60, "倒计时 05:00", {"active": True, "valid": 3}
+        )
+        bot._maybe_auto_truncate(as_page(page))
+        self.assertEqual(ai.truncate_requests, 0)
+
+    def test_keeps_waiting_until_first_valid_answer_arrives(self):
+        """0 个有效答案时不截断；出现第一个有效答案后立刻截断。"""
+        progress = {"active": True, "valid": 0, "received": 0, "total": 30}
+        bot, page, ai = self._bot(60, "倒计时 00:30", progress)
+
+        bot._maybe_auto_truncate(as_page(page))
+        self.assertEqual(ai.truncate_requests, 0)
+
+        ai.progress = {"active": True, "valid": 1, "received": 1, "total": 30}
+        bot._maybe_auto_truncate(as_page(page))
+        self.assertEqual(ai.truncate_requests, 1)
+
+    def test_triggers_only_once_per_question(self):
+        bot, page, ai = self._bot(
+            60, "倒计时 00:20", {"active": True, "valid": 2}
+        )
+        for _ in range(3):
+            bot._maybe_auto_truncate(as_page(page))
+        self.assertEqual(ai.truncate_requests, 1)
+
+    def test_new_question_can_trigger_again(self):
+        bot, page, ai = self._bot(
+            60, "倒计时 00:20", {"active": True, "valid": 2}
+        )
+        bot._maybe_auto_truncate(as_page(page))
+        bot._answer_question_id = "q2"
+        bot._maybe_auto_truncate(as_page(page))
+        self.assertEqual(ai.truncate_requests, 2)
+
+    def test_disabled_when_threshold_is_zero(self):
+        bot, page, ai = self._bot(
+            0, "倒计时 00:05", {"active": True, "valid": 9}
+        )
+        bot._maybe_auto_truncate(as_page(page))
+        self.assertEqual(ai.truncate_requests, 0)
+
+    def test_no_truncation_without_readable_countdown(self):
+        """已完成 / 不限时 / 无节点 → 读不到剩余秒数，不该截断。"""
+        for text in ("已完成", "作答已结束", "老师可能会随时结束答题", "倒计时 --:--"):
+            with self.subTest(text=text):
+                bot, page, ai = self._bot(60, text, {"active": True, "valid": 5})
+                bot._maybe_auto_truncate(as_page(page))
+                self.assertEqual(ai.truncate_requests, 0)
+
+    def test_no_truncation_when_multi_ai_is_not_collecting(self):
+        """单AI模式或本轮已收尾时 active 为假，没有可提前结束的收集过程。"""
+        bot, page, ai = self._bot(60, "倒计时 00:10", {"active": False, "valid": 5})
+        bot._maybe_auto_truncate(as_page(page))
+        self.assertEqual(ai.truncate_requests, 0)
+
+    def test_skips_countdown_read_when_not_collecting(self):
+        """active 为假时不应读倒计时 DOM（先内存判断，再碰页面）。"""
+        bot, page, _ai = self._bot(60, "倒计时 00:10", {"active": False, "valid": 5})
+        with patch.object(bot, "_read_remaining_seconds") as read:
+            bot._maybe_auto_truncate(as_page(page))
+        read.assert_not_called()
+
+    def test_skips_when_ai_stub_lacks_truncate_api(self):
+        """AI 桩没有多AI接口时安全跳过（不抛异常）。"""
+
+        class BareAI:
+            def submit_answer(self, **kwargs):
+                return Future()
+
+        bot, page, _ai = self._bot(60, "倒计时 00:10", {"active": True, "valid": 5})
+        bot.ai = cast(Any, BareAI())
+        bot._maybe_auto_truncate(as_page(page))  # 不应抛异常
 
 
 class TabLeakGuardTests(unittest.TestCase):

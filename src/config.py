@@ -52,6 +52,7 @@ DEFAULTS: dict[str, Any] = {
     "custom_ai_model": "",
     "multi_ai_config_path": "model_visible.ini",
     "multi_ai_timeout": 20,
+    "auto_truncate_seconds": 0,  # 答题自动截断时间（秒），0 表示不启用
     "submit_delay": 1,
     "check_interval": 60,
     "quiz_refresh_interval": 1,
@@ -179,6 +180,7 @@ class Config:
             "check_interval": (5, 3600),
             "quiz_refresh_interval": (1, 300),
             "multi_ai_timeout": (1, 300),
+            "auto_truncate_seconds": (0, 3600),
         }
         for key, (lo, hi) in int_fields.items():
             val = settings.get(key)
