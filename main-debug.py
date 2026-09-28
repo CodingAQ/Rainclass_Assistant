@@ -17,6 +17,12 @@ def main() -> None:
         action="store_true",
         help="run the bot without answering: enter class and sign in only",
     )
+    parser.add_argument(
+        "--not-enter",
+        action="store_true",
+        help="run the bot without entering class: stay on the homepage "
+        "for external CDP inspection",
+    )
     args = parser.parse_args()
 
     # BrowserManager reads these values when the bot creates it.
@@ -24,6 +30,8 @@ def main() -> None:
     os.environ["RAINCLASS_DEBUG_PORT"] = str(args.port)
     if args.no_answer:
         os.environ["RAINCLASS_NO_ANSWER"] = "1"
+    if args.not_enter:
+        os.environ["RAINCLASS_NO_ENTER"] = "1"
 
     from main import run_app
 

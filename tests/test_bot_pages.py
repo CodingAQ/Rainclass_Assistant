@@ -452,6 +452,60 @@ class ClassroomPageTests(unittest.TestCase):
         )
         self.assertFalse(make_bot()._click_active_class(as_page(page)))
 
+    def test_click_active_class_clicks_listening_item_not_exam(self):
+        # 2026-09 前端：展开面板条目为 .lessonlist，只点「听」，绝不点「考试」
+        live = FakeItem(selectors={".status": [FakeItem(text="听")]})
+        exam = FakeItem(selectors={".status": [FakeItem(text="考试")]})
+        page = FakePage(
+            "https://changjiang.yuketang.cn/v2/web/index",
+            {
+                ".onlesson .lessonlist": [live, exam],
+                ".onlesson .onlessonlist": [FakeItem()],  # 面板已展开
+            },
+        )
+        bot = make_bot()
+        self.assertTrue(bot._click_active_class(as_page(page)))
+        self.assertTrue(live.clicked)
+        self.assertEqual(exam.click_count, 0)
+
+    def test_click_active_class_expands_banner_before_clicking_item(self):
+        live = FakeItem(selectors={".status": [FakeItem(text="听")]})
+        page = FakePage("https://changjiang.yuketang.cn/v2/web/index")
+
+        def expand():
+            page.selectors[".onlesson .lessonlist"] = [live]
+            page.selectors[".onlesson .onlessonlist"] = [FakeItem()]
+
+        page.selectors[".onlesson > .tipbar"] = [FakeItem(on_click=expand)]
+        self.assertTrue(make_bot()._click_active_class(as_page(page)))
+        self.assertTrue(live.clicked)
+
+    def test_exam_only_banner_is_never_clicked(self):
+        # 只有考试条目 = 没有在课课程，不得点击任何条目
+        exam = FakeItem(selectors={".status": [FakeItem(text="考试")]})
+        page = FakePage(
+            "https://changjiang.yuketang.cn/v2/web/index",
+            {
+                ".onlesson .lessonlist": [exam],
+                ".onlesson .onlessonlist": [FakeItem()],
+            },
+        )
+        self.assertFalse(make_bot()._click_active_class(as_page(page)))
+        self.assertEqual(exam.click_count, 0)
+
+    def test_live_item_detected_by_audio_icon_fallback(self):
+        # status 文案变体防御：右侧音频播放图标也能识别在课条目
+        live = FakeItem(selectors={"i[class*='icon--yinpinbofang']": [FakeItem()]})
+        page = FakePage(
+            "https://changjiang.yuketang.cn/v2/web/index",
+            {
+                ".onlesson .lessonlist": [live],
+                ".onlesson .onlessonlist": [FakeItem()],
+            },
+        )
+        self.assertTrue(make_bot()._click_active_class(as_page(page)))
+        self.assertTrue(live.clicked)
+
     def test_new_quiz_prompt_is_clicked(self):
         prompt = FakeItem()
         page = FakePage(

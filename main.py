@@ -29,6 +29,7 @@ APP_WIDTH = 900
 APP_HEIGHT = 700
 APP_MIN_W = 600
 APP_MIN_H = 500
+GUI_LOG_LENGTH_MAX = 200
 
 # 日志格式化器
 LOG_FORMAT = logging.Formatter(
@@ -119,7 +120,7 @@ def _setup_logging() -> None:
 
     gh = _GuiLogHandler()
     gh.setFormatter(LOG_FORMAT)
-    gh.addFilter(_MaxLogLengthFilter(120))
+    gh.addFilter(_MaxLogLengthFilter(limit=GUI_LOG_LENGTH_MAX))
 
     _log_listener = QueueListener(_log_queue, fh, gh)
     _log_listener.start()
@@ -830,6 +831,16 @@ class App(ctk.CTk):
         if not auto_answer:
             self._log("⚠ 调试模式：本次不会自动答题，仅进课堂与签到。")
 
+        # 调试入口（main-debug.py --not-enter）通过环境变量关闭自动进入课堂。
+        auto_enter = os.environ.get("RAINCLASS_NO_ENTER", "").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if not auto_enter:
+            self._log("⚠ 调试模式：本次不会自动进入课堂，浏览器停留在首页。")
+
         bot = Bot(
             config=self.config,
             browser=self.browser,
@@ -837,6 +848,7 @@ class App(ctk.CTk):
             notification=self.notification,
             stop_event=self.stop_event,
             auto_answer=auto_answer,
+            auto_enter=auto_enter,
         )
 
         thread: threading.Thread
