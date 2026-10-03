@@ -33,8 +33,6 @@ python -m playwright install chromium
 
 ### 3. 配置 AI API Key 和微信提醒
 
-在首次运行程序后，会在项目根目录生成 `config.json` 文件。您也可以通过图形界面在“设置”页面进行配置：
-
 - **AI模型选择**: 选择`豆包AI`、`Gemini AI`、`自定义`或`多AI作答`。
 - **豆包AI API Key / Gemini AI API Key**: 填写您选择的AI模型的API Key。
 - **多AI作答**: 默认读取项目根目录的 `model_visible.ini`，每个 section 需配置 `base_url`、`key` 和 `model`。所有模型同时请求，可修改配置文件路径和最大等待时间。选择多 AI 后点击“测试”会同时测试文件中的全部模型。
